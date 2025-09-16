@@ -1,0 +1,168 @@
+-- RAP: DOCUMENT REQUEST TESTING QUERIES
+select * from person
+
+SELECT dp.document_purpose_id, rdt.request_document_type_name, dp.purpose_code
+FROM document_purpose dp
+JOIN request_document_type rdt
+  ON rdt.request_document_type_id = dp.request_document_type_id
+WHERE rdt.request_document_type_name = 'BARANGAY CLEARANCE'
+  AND dp.purpose_code = 'RESIDENCY_LOCAL'
+LIMIT 1;
+
+-- 2) Create a new request for HANNAH DIAN (person_id = 193), 1 copy
+--    (Replace 193 if you want a different requester.)
+SELECT create_document_request(
+  4,                     -- p_requested_by
+  181, TRUE,             -- p_on_behalf_of, p_is_on_behalf
+  NULL,                    -- p_business_id (none)
+  'Residency (Local) certificate',  -- p_purpose_notes
+  jsonb_build_array(
+    jsonb_build_object(
+      'document_purpose_id',
+      (SELECT dp.document_purpose_id
+       FROM document_purpose dp
+       JOIN request_document_type rdt
+         ON rdt.request_document_type_id = dp.request_document_type_id
+      WHERE rdt.request_document_type_name='BARANGAY CLEARANCE'
+        AND dp.purpose_code='RESIDENCY_LOCAL'
+      LIMIT 1),
+      'quantity', 1
+    )
+  )
+) AS new_doc_request_id;
+
+
+-- 3) Check amount due for the latest request by HANNAH
+SELECT get_request_amount_due(
+  (SELECT MAX(doc_request_id) FROM doc_request_hdr WHERE requested_by_person_id = 4)
+) AS amount_due;
+
+
+-- 4) Treasurer (staff_id = 5, BT-001) accepts full payment in CASH
+WITH rid AS (
+  SELECT MAX(doc_request_id) AS id
+  FROM doc_request_hdr
+  WHERE requested_by_person_id = 4
+)
+SELECT treasurer_accept_payment(
+  (SELECT id FROM rid),
+  (SELECT payment_method_id FROM payment_method WHERE method_name='CASH' LIMIT 1),
+  5,  -- BT-001 treasurer
+  get_request_amount_due((SELECT id FROM rid)),
+  NULL
+) AS new_or_id;
+
+
+-- 5) Forward to printing (Clerk step)
+SELECT forward_to_clerk_for_printing(
+  (SELECT MAX(doc_request_id) FROM doc_request_hdr WHERE requested_by_person_id = 4)
+);
+
+-- 6) Mark released (after printing/signing)
+SELECT mark_request_released(
+  (SELECT MAX(doc_request_id) FROM doc_request_hdr WHERE requested_by_person_id = 4)
+);
+
+-- 7) (Optional) Inspect list/detail and payments
+SELECT * FROM v_doc_request_list
+WHERE doc_request_id = (SELECT MAX(doc_request_id) FROM doc_request_hdr WHERE requested_by_person_id = 4);
+
+SELECT * FROM v_doc_request_detail
+WHERE doc_request_id = (SELECT MAX(doc_request_id) FROM doc_request_hdr WHERE requested_by_person_id = 4);
+
+SELECT * FROM official_receipt
+WHERE doc_request_id = (SELECT MAX(doc_request_id) FROM doc_request_hdr WHERE requested_by_person_id = 4);
+
+-- ALL DOCUMENT REQUESTS LIST
+select * from v_doc_request_list
+
+-- FULL REQUEST DETAIL
+select * from v_doc_request_detail
+
+-- DETAILED DOCUMENT REQUEST COMMON LOGS
+select * from v_document_timeline;
+
+-- DETAILED DOCUMENT REQUESTS LIST
+select * from  v_doc_request_detail_lines
+
+-- LIST OF PAID DOCUMENTS
+select * from v_doc_request_payments
+
+-- DEBUG
+SELECT schemaname, viewname
+FROM pg_views
+WHERE viewname IN (
+  'v_doc_request_list','v_doc_request_detail',
+  'v_document_timeline','v_doc_request_detail_lines','v_doc_request_payments'
+)
+ORDER BY schemaname, viewname;
+
+
+-- replace :requester_id and :subject_id
+SELECT *
+FROM person_kinship pk
+WHERE (pk.src_person_id = 181 AND pk.dst_person_id = 4)
+
+SELECT relationship_id, relationship_name, code
+FROM relationship
+WHERE code IN ('MOTHER','FATHER','GUARDIAN','SPOUSE','CHILD','WARD');  -- adjust to your codes
+
+
+
+
+-- Which fee items would be fully/partially waived for this person?
+WITH subject AS (
+  SELECT p.person_id,
+         p.birthdate,
+         (age(current_date, p.birthdate) >= interval '60 years') AS is_senior,
+         upper(g.gov_mem_prog_name) AS program
+  FROM person p
+  LEFT JOIN government_membership_prog g
+    ON g.gov_mem_prog_id = p.gov_mem_prog_id
+  WHERE p.person_id = 4
+),
+calc AS (
+  SELECT fi.fee_item_id, fi.fee_code, fi.name, fi.current_amount,
+         fi.exempt_ftj, fi.exempt_senior, fi.exempt_pwd, fi.exempt_indigent,
+         s.is_senior, s.program,
+         compute_exemption_amount(s.person_id, fi.fee_item_id, '{}'::jsonb) AS waive_one_copy
+  FROM fee_item fi
+  CROSS JOIN subject s
+)
+SELECT fee_code, name, current_amount,
+       exempt_ftj, exempt_senior, exempt_pwd, exempt_indigent,
+       program AS gov_program, is_senior,
+       waive_one_copy,
+       CASE WHEN waive_one_copy >= current_amount THEN 'FULLY WAIVED'
+            WHEN waive_one_copy > 0 THEN 'PARTIAL'
+            ELSE 'PAYABLE'
+       END AS status
+FROM calc
+ORDER BY fee_code;
+
+
+-- List existing request lines that ended up at ₱0 total
+SELECT h.request_code,
+       to_char(h.created_at AT TIME ZONE 'Asia/Manila','YYYY-MM-DD HH24:MI') AS created_at,
+       rb.first_name || ' ' || rb.last_name AS requested_by,
+       COALESCE(ob.first_name || ' ' || ob.last_name,'') AS on_behalf_of,
+       fi.fee_code,
+       l.quantity,
+       l.base_amount,
+       l.waived_amount,
+       l.surcharge_amount,
+       l.line_total
+FROM doc_request_line l
+JOIN doc_request_hdr h ON h.doc_request_id = l.doc_request_id
+JOIN fee_item fi ON fi.fee_item_id = l.fee_item_id
+LEFT JOIN person rb ON rb.person_id = h.requested_by_person_id
+LEFT JOIN person ob ON ob.person_id = h.on_behalf_of_person_id
+WHERE l.line_total = 0
+ORDER BY h.created_at DESC
+LIMIT 100;
+
+
+SELECT fee_code, name, current_amount,
+       exempt_ftj, exempt_senior, exempt_pwd, exempt_indigent
+FROM fee_item
+ORDER BY fee_code;
