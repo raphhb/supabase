@@ -1,4 +1,4 @@
--- RAP: DOCUMENT REQUEST TESTING QUERIES
+-- RAP GITHUB: DOCUMENT REQUEST TESTING QUERIES
 select * from person
 
 SELECT dp.document_purpose_id, rdt.request_document_type_name, dp.purpose_code
