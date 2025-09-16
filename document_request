@@ -1,94 +1,1017 @@
--- RAP GITHUB: DOCUMENT REQUEST TESTING QUERIES
-select * from person
+-- RAP DOCUMENT REQUEST QUERY
+-- Added some in request_status table
+INSERT INTO request_status (request_status_name)
+SELECT unnest(ARRAY['FOR_TREASURER_REVIEW','PAID','FOR_PRINTING','RELEASED'])
+ON CONFLICT DO NOTHING;
 
-SELECT dp.document_purpose_id, rdt.request_document_type_name, dp.purpose_code
-FROM document_purpose dp
-JOIN request_document_type rdt
-  ON rdt.request_document_type_id = dp.request_document_type_id
-WHERE rdt.request_document_type_name = 'BARANGAY CLEARANCE'
-  AND dp.purpose_code = 'RESIDENCY_LOCAL'
-LIMIT 1;
+-- Relationship allow-list for on-behalf
+INSERT INTO relationship(relationship_name)
+SELECT unnest(ARRAY['SPOUSE','PARENT', 'MOTHER', 'FATHER', 'CHILD','SIBLING'])
+ON CONFLICT (relationship_name) DO NOTHING;
 
--- 2) Create a new request for HANNAH DIAN (person_id = 193), 1 copy
---    (Replace 193 if you want a different requester.)
-SELECT create_document_request(
-  4,                     -- p_requested_by
-  181, TRUE,             -- p_on_behalf_of, p_is_on_behalf
-  NULL,                    -- p_business_id (none)
-  'Residency (Local) certificate',  -- p_purpose_notes
-  jsonb_build_array(
-    jsonb_build_object(
-      'document_purpose_id',
-      (SELECT dp.document_purpose_id
-       FROM document_purpose dp
-       JOIN request_document_type rdt
-         ON rdt.request_document_type_id = dp.request_document_type_id
-      WHERE rdt.request_document_type_name='BARANGAY CLEARANCE'
-        AND dp.purpose_code='RESIDENCY_LOCAL'
-      LIMIT 1),
-      'quantity', 1
-    )
-  )
-) AS new_doc_request_id;
+-- Add the on behalf relationships
+CREATE TABLE IF NOT EXISTS allowed_on_behalf_relationship (
+  relationship_id INT PRIMARY KEY REFERENCES relationship(relationship_id) ON DELETE CASCADE
+);
+INSERT INTO allowed_on_behalf_relationship(relationship_id)
+SELECT relationship_id FROM relationship
+WHERE relationship_name IN ('SPOUSE','MOTHER', 'FATHER', 'CHILD')
+ON CONFLICT DO NOTHING;
+
+-- Payment methods
+CREATE TABLE IF NOT EXISTS payment_method (
+  payment_method_id SERIAL PRIMARY KEY,
+  method_name TEXT UNIQUE NOT NULL
+);
+INSERT INTO payment_method(method_name)
+SELECT unnest(ARRAY['CASH','GCASH','CARD'])
+ON CONFLICT DO NOTHING;
+
+-- Government membership programs (for exemptions)
+INSERT INTO government_membership_prog(gov_mem_prog_name)
+SELECT unnest(ARRAY['FIRST TIME JOBSEEKER', 'INDIGENT'])
+ON CONFLICT (gov_mem_prog_name) DO NOTHING;
+
+-- Request/OR code generators
+CREATE SEQUENCE IF NOT EXISTS doc_request_seq;
+CREATE OR REPLACE FUNCTION make_request_code() RETURNS TEXT
+LANGUAGE sql AS $$ SELECT 'REQ-'||to_char(now(),'YYYYMMDD')||'-'||lpad(nextval('doc_request_seq')::text,6,'0'); $$;
+
+CREATE SEQUENCE IF NOT EXISTS or_serial_seq;
+CREATE OR REPLACE FUNCTION make_or_number() RETURNS TEXT
+LANGUAGE sql AS $$ SELECT 'OR-'||to_char(now(),'YYYYMMDD')||'-'||lpad(nextval('or_serial_seq')::text,6,'0'); $$;
+
+-- 1) New request-specific document types
+CREATE TABLE IF NOT EXISTS request_document_type (
+  request_document_type_id   SERIAL PRIMARY KEY,
+  request_document_type_name VARCHAR(100) UNIQUE NOT NULL
+);
+
+-- 2) Seed the request-document types used by the request feature
+INSERT INTO request_document_type (request_document_type_name)
+SELECT unnest(ARRAY[
+  'BARANGAY CLEARANCE',
+  'CERTIFICATE OF RESIDENCY',
+  'CERTIFICATE OF INDIGENCY',
+  'BARANGAY BUSINESS CLEARANCE'
+])
+ON CONFLICT (request_document_type_name) DO NOTHING;
 
 
--- 3) Check amount due for the latest request by HANNAH
-SELECT get_request_amount_due(
-  (SELECT MAX(doc_request_id) FROM doc_request_hdr WHERE requested_by_person_id = 4)
-) AS amount_due;
 
+-- B. Fees, surcharge ladder, purposes
+-- Add table FEE_ITEM
+-- 1) Fee catalog now references request_document_type (not your other document_type)
+CREATE TABLE IF NOT EXISTS fee_item (
+  fee_item_id      SERIAL PRIMARY KEY,
+  fee_code         TEXT UNIQUE NOT NULL,
+  name             TEXT NOT NULL,
+  request_document_type_id INT
+      REFERENCES request_document_type(request_document_type_id)
+      ON UPDATE CASCADE ON DELETE SET NULL,
+  unit             TEXT DEFAULT 'per_doc',
+  max_amount       NUMERIC(12,2),
+  current_amount   NUMERIC(12,2) NOT NULL DEFAULT 0,
+  exempt_ftj       BOOLEAN DEFAULT FALSE,
+  exempt_senior    BOOLEAN DEFAULT FALSE,
+  exempt_pwd       BOOLEAN DEFAULT FALSE,
+  exempt_indigent  BOOLEAN DEFAULT FALSE,
+  is_active        BOOLEAN DEFAULT TRUE
+);
 
--- 4) Treasurer (staff_id = 5, BT-001) accepts full payment in CASH
-WITH rid AS (
-  SELECT MAX(doc_request_id) AS id
-  FROM doc_request_hdr
-  WHERE requested_by_person_id = 4
+-- 2) Surcharge ladder unchanged
+CREATE TABLE IF NOT EXISTS surcharge_rule (
+  surcharge_rule_id SERIAL PRIMARY KEY,
+  fee_item_id INT NOT NULL REFERENCES fee_item(fee_item_id) ON DELETE CASCADE,
+  offense_no  INT NOT NULL CHECK (offense_no BETWEEN 1 AND 3),
+  percent     NUMERIC(8,2) NOT NULL CHECK (percent >= 0),
+  UNIQUE (fee_item_id, offense_no)
+);
+
+-- 3) Purpose → Fee mapping now points to request_document_type
+CREATE TABLE IF NOT EXISTS document_purpose (
+  document_purpose_id SERIAL PRIMARY KEY,
+  request_document_type_id INT NOT NULL
+      REFERENCES request_document_type(request_document_type_id)
+      ON DELETE CASCADE,
+  purpose_code   TEXT NOT NULL,
+  purpose_label  TEXT NOT NULL,
+  fee_item_id    INT NOT NULL REFERENCES fee_item(fee_item_id) ON DELETE RESTRICT,
+  default_details JSONB DEFAULT '{}'::jsonb,
+  default_offense_no INT,
+  UNIQUE (request_document_type_id, purpose_code)
+);
+
+-- 4) Seed the request document types (these are for the request system only)
+INSERT INTO request_document_type (request_document_type_name)
+SELECT unnest(ARRAY[
+  'BARANGAY CLEARANCE',
+  'CERTIFICATE OF RESIDENCY',
+  'CERTIFICATE OF INDIGENCY',
+  'BARANGAY BUSINESS CLEARANCE'
+])
+ON CONFLICT (request_document_type_name) DO NOTHING;
+
+-- 5) Seed fees per ordinance against request_document_type
+WITH rdt AS (
+  SELECT request_document_type_id, request_document_type_name
+  FROM request_document_type
 )
-SELECT treasurer_accept_payment(
-  (SELECT id FROM rid),
-  (SELECT payment_method_id FROM payment_method WHERE method_name='CASH' LIMIT 1),
-  5,  -- BT-001 treasurer
-  get_request_amount_due((SELECT id FROM rid)),
-  NULL
-) AS new_or_id;
+INSERT INTO fee_item(
+  fee_code,name,request_document_type_id,unit,max_amount,current_amount,
+  exempt_ftj,exempt_senior,exempt_pwd,exempt_indigent
+)
+SELECT *
+FROM (
+  VALUES
+   ('CLR_EMPLOYMENT','Barangay Clearance – Employment',
+     (SELECT request_document_type_id FROM rdt WHERE request_document_type_name='BARANGAY CLEARANCE'),
+     'per_doc', NULL,  80.00,  TRUE,  TRUE,  TRUE,  TRUE),
 
+   ('CLR_RESIDENCY_LOCAL','Barangay Clearance – Residency (Local)',
+     (SELECT request_document_type_id FROM rdt WHERE request_document_type_name='BARANGAY CLEARANCE'),
+     'per_doc', NULL,  80.00,  FALSE, TRUE,  TRUE,  TRUE),
 
--- 5) Forward to printing (Clerk step)
-SELECT forward_to_clerk_for_printing(
-  (SELECT MAX(doc_request_id) FROM doc_request_hdr WHERE requested_by_person_id = 4)
+   ('CLR_RESIDENCY_INTL','Barangay Clearance – Residency (International)',
+     (SELECT request_document_type_id FROM rdt WHERE request_document_type_name='BARANGAY CLEARANCE'),
+     'per_doc', NULL, 1530.00, FALSE, FALSE, FALSE, FALSE),
+
+   ('BUSC_GROCERY','Barangay Business Clearance – Groceries',
+     (SELECT request_document_type_id FROM rdt WHERE request_document_type_name='BARANGAY BUSINESS CLEARANCE'),
+     'per_doc', 5000.00, 500.00, FALSE, FALSE, FALSE, FALSE)
+) f(fee_code,name,request_document_type_id,unit,max_amount,current_amount,ex_ftj,ex_senior,ex_pwd,ex_indigent)
+ON CONFLICT (fee_code) DO NOTHING;
+
+-- 6) Surcharges for Intl Residency (same logic)
+INSERT INTO surcharge_rule(fee_item_id, offense_no, percent)
+SELECT fi.fee_item_id, x.offense_no, x.percent
+FROM fee_item fi
+JOIN (VALUES (1,10.0),(2,20.0),(3,50.0)) AS x(offense_no,percent) ON TRUE
+WHERE fi.fee_code='CLR_RESIDENCY_INTL'
+ON CONFLICT (fee_item_id, offense_no) DO NOTHING;
+
+-- 7) Purpose → Fee mapping now joins request_document_type
+-- Purpose → Fee mapping (fixed types)
+INSERT INTO document_purpose(
+  request_document_type_id, purpose_code, purpose_label,
+  fee_item_id, default_details, default_offense_no
+)
+SELECT
+  rdt.request_document_type_id,
+  x.purpose_code,
+  x.purpose_label,
+  fi.fee_item_id,
+  x.def_details,
+  x.def_offense
+FROM (
+  VALUES
+    -- offense is NULL (no surcharge tier)
+    ('BARANGAY CLEARANCE','EMPLOYMENT','Employment','CLR_EMPLOYMENT',
+       '{}'::jsonb, NULL::INT),
+
+    ('BARANGAY CLEARANCE','RESIDENCY_LOCAL','Residency (Local)','CLR_RESIDENCY_LOCAL',
+       jsonb_build_object('residency_kind','LOCAL'), NULL::INT),
+
+    ('BARANGAY CLEARANCE','RESIDENCY_INTERNATIONAL','Residency (International)','CLR_RESIDENCY_INTL',
+       jsonb_build_object('residency_kind','INTERNATIONAL'), NULL::INT),
+
+    ('BARANGAY BUSINESS CLEARANCE','GROCERY','Groceries','BUSC_GROCERY',
+       jsonb_build_object('business_category','Groceries'), NULL::INT)
+) AS x(doc_type_name, purpose_code, purpose_label, fee_code, def_details, def_offense)
+JOIN request_document_type rdt
+  ON rdt.request_document_type_name = x.doc_type_name
+JOIN fee_item fi
+  ON fi.fee_code = x.fee_code
+ON CONFLICT (request_document_type_id, purpose_code) DO NOTHING;
+
+SELECT request_document_type_id, request_document_type_name FROM request_document_type;
+SELECT * FROM document_purpose ORDER BY request_document_type_id, purpose_code;
+
+-- C) Document request header/lines + OR + fee change log
+-- (No changes needed due to request_document_type; fee_item FK remains valid.)
+
+CREATE TABLE IF NOT EXISTS doc_request_hdr (
+  doc_request_id           SERIAL PRIMARY KEY,
+  request_code             TEXT UNIQUE NOT NULL DEFAULT make_request_code(),
+  created_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
+  requested_by_person_id   INT NOT NULL REFERENCES person(person_id) ON DELETE RESTRICT,
+  on_behalf_of_person_id   INT REFERENCES person(person_id) ON DELETE RESTRICT,
+  is_on_behalf             BOOLEAN NOT NULL DEFAULT FALSE,
+  business_id              INT REFERENCES business(business_id) ON DELETE SET NULL,
+  purpose_notes            TEXT,
+  request_status_id        INT NOT NULL REFERENCES request_status(request_status_id) ON UPDATE CASCADE,
+  current_status_set_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_doc_request_hdr_person ON doc_request_hdr(requested_by_person_id);
+CREATE INDEX IF NOT EXISTS ix_doc_request_hdr_status ON doc_request_hdr(request_status_id);
+
+CREATE TABLE IF NOT EXISTS doc_request_line (
+  doc_request_line_id  SERIAL PRIMARY KEY,
+  doc_request_id       INT NOT NULL REFERENCES doc_request_hdr(doc_request_id) ON DELETE CASCADE,
+  fee_item_id          INT NOT NULL REFERENCES fee_item(fee_item_id),     -- fee_item now tied to request_document_type (from B)
+  quantity             INT NOT NULL DEFAULT 1 CHECK (quantity > 0),
+  base_amount          NUMERIC(12,2) NOT NULL DEFAULT 0,
+  waived_amount        NUMERIC(12,2) NOT NULL DEFAULT 0,
+  surcharge_amount     NUMERIC(12,2) NOT NULL DEFAULT 0,
+  line_total           NUMERIC(12,2) NOT NULL DEFAULT 0,
+  details              JSONB DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS ix_doc_request_line_req ON doc_request_line(doc_request_id);
+-- Optional helper index (speeds up fee audits per fee_code)
+CREATE INDEX IF NOT EXISTS ix_doc_request_line_fee ON doc_request_line(fee_item_id);
+
+CREATE TABLE IF NOT EXISTS official_receipt (
+  or_id              SERIAL PRIMARY KEY,
+  or_number          TEXT UNIQUE NOT NULL DEFAULT make_or_number(),
+  issued_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  issued_by_staff_id INT NOT NULL REFERENCES staff(staff_id),
+  doc_request_id     INT NOT NULL REFERENCES doc_request_hdr(doc_request_id) ON DELETE CASCADE,
+  payment_method_id  INT NOT NULL REFERENCES payment_method(payment_method_id),
+  amount_due         NUMERIC(12,2) NOT NULL CHECK (amount_due  >= 0),
+  amount_paid        NUMERIC(12,2) NOT NULL CHECK (amount_paid >= 0),
+  change_due         NUMERIC(12,2) NOT NULL DEFAULT 0 CHECK (change_due >= 0)
 );
 
--- 6) Mark released (after printing/signing)
-SELECT mark_request_released(
-  (SELECT MAX(doc_request_id) FROM doc_request_hdr WHERE requested_by_person_id = 4)
+CREATE TABLE IF NOT EXISTS fee_change_log (
+  fee_change_log_id     SERIAL PRIMARY KEY,
+  changed_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+  fee_item_id           INT NOT NULL REFERENCES fee_item(fee_item_id),
+  old_amount            NUMERIC(12,2),
+  new_amount            NUMERIC(12,2) NOT NULL,
+  changed_by_staff_id   INT NOT NULL REFERENCES staff(staff_id),
+  reason                TEXT
 );
+CREATE INDEX IF NOT EXISTS ix_fee_change_log_item ON fee_change_log(fee_item_id, changed_at DESC);
 
--- 7) (Optional) Inspect list/detail and payments
-SELECT * FROM v_doc_request_list
-WHERE doc_request_id = (SELECT MAX(doc_request_id) FROM doc_request_hdr WHERE requested_by_person_id = 4);
 
-SELECT * FROM v_doc_request_detail
-WHERE doc_request_id = (SELECT MAX(doc_request_id) FROM doc_request_hdr WHERE requested_by_person_id = 4);
+-- D) Lookups for the UI (updated to use request_document_type)
 
-SELECT * FROM official_receipt
-WHERE doc_request_id = (SELECT MAX(doc_request_id) FROM doc_request_hdr WHERE requested_by_person_id = 4);
+-- 1) Document types list (compat: same column names)
+CREATE OR REPLACE FUNCTION get_document_types()
+RETURNS TABLE(document_type_id INT, document_type_name TEXT)
+LANGUAGE sql AS $$
+  SELECT
+    request_document_type_id   AS document_type_id,
+    request_document_type_name AS document_type_name
+  FROM request_document_type
+  ORDER BY request_document_type_name;
+$$;
 
--- ALL DOCUMENT REQUESTS LIST
-select * from v_doc_request_list
+-- 2) Purposes for a given request document type
+CREATE OR REPLACE FUNCTION get_purposes_by_document_type(p_document_type_id INT)
+RETURNS TABLE(
+  document_purpose_id INT, purpose_code TEXT, purpose_label TEXT,
+  fee_code TEXT, current_amount NUMERIC, max_amount NUMERIC,
+  default_details JSONB, default_offense_no INT
+)
+LANGUAGE sql AS $$
+  SELECT dp.document_purpose_id,
+         dp.purpose_code,
+         dp.purpose_label,
+         fi.fee_code,
+         fi.current_amount,
+         fi.max_amount,
+         dp.default_details,
+         dp.default_offense_no
+  FROM document_purpose dp
+  JOIN fee_item fi
+    ON fi.fee_item_id = dp.fee_item_id
+  WHERE dp.request_document_type_id = p_document_type_id
+  ORDER BY dp.purpose_label;
+$$;
 
--- FULL REQUEST DETAIL
-select * from v_doc_request_detail
+-- 3) Payment methods (unchanged)
+CREATE OR REPLACE FUNCTION get_payment_methods()
+RETURNS TABLE(payment_method_id INT, method_name TEXT)
+LANGUAGE sql AS $$
+  SELECT payment_method_id, method_name
+  FROM payment_method
+  ORDER BY method_name;
+$$;
 
--- DETAILED DOCUMENT REQUEST COMMON LOGS
-select * from v_document_timeline;
+-- 4) Allowed relationships (unchanged)
+CREATE OR REPLACE FUNCTION get_allowed_on_behalf_relationships()
+RETURNS TABLE(relationship_id INT, relationship_name TEXT)
+LANGUAGE sql AS $$
+  SELECT r.relationship_id, r.relationship_name
+  FROM allowed_on_behalf_relationship a
+  JOIN relationship r ON r.relationship_id = a.relationship_id
+  ORDER BY r.relationship_name;
+$$;
 
--- DETAILED DOCUMENT REQUESTS LIST
-select * from  v_doc_request_detail_lines
+-- 5) Resident profile flags (unchanged)
+CREATE OR REPLACE FUNCTION get_resident_profile_flags(p_person_id INT)
+RETURNS TABLE(
+  person_id INT, first_name TEXT, last_name TEXT,
+  is_student BOOLEAN, is_senior BOOLEAN, is_pwd BOOLEAN, is_indigent BOOLEAN, is_ftj BOOLEAN
+)
+LANGUAGE sql AS $$
+  SELECT p.person_id, p.first_name, p.last_name,
+         (EXISTS (SELECT 1 FROM employment_status es
+                  WHERE es.employment_status_id = p.employment_status_id
+                    AND upper(es.employment_status_name) LIKE '%STUDENT%'))
+         OR (EXISTS (SELECT 1 FROM educational_attainment ea
+                     WHERE ea.education_id = p.education_id
+                       AND upper(ea.educ_level) LIKE '%STUDENT%')) AS is_student,
+         (age(current_date, p.birthdate) >= interval '60 years') AS is_senior,
+         (EXISTS (SELECT 1 FROM government_membership_prog g
+                  WHERE g.gov_mem_prog_id = p.gov_mem_prog_id
+                    AND upper(g.gov_mem_prog_name) = 'PWD')) AS is_pwd,
+         (EXISTS (SELECT 1 FROM government_membership_prog g
+                  WHERE g.gov_mem_prog_id = p.gov_mem_prog_id
+                    AND upper(g.gov_mem_prog_name) = 'INDIGENT')) AS is_indigent,
+         (EXISTS (SELECT 1 FROM government_membership_prog g
+                  WHERE g.gov_mem_prog_id = p.gov_mem_prog_id
+                    AND upper(g.gov_mem_prog_name) = 'FIRST_TIME_JOBSEEKER')) AS is_ftj
+  FROM person p
+  WHERE p.person_id = p_person_id;
+$$;
 
--- LIST OF PAID DOCUMENTS
-select * from v_doc_request_payments
+-- 6) Businesses owned by a person (unchanged)
+CREATE OR REPLACE FUNCTION get_businesses_owned_by_person(p_person_id INT)
+RETURNS TABLE(business_id INT, business_name TEXT)
+LANGUAGE sql AS $$
+  SELECT b.business_id, b.business_name
+  FROM business b
+  WHERE b.business_owner_id = p_person_id
+  ORDER BY b.business_name;
+$$;
 
--- DEBUG
+-- 7) Fee search (show type from request_document_type)
+CREATE OR REPLACE FUNCTION search_fee_items(p_query TEXT)
+RETURNS TABLE(fee_code TEXT, name TEXT, current_amount NUMERIC, max_amount NUMERIC, document_type TEXT)
+LANGUAGE sql AS $$
+  SELECT fi.fee_code,
+         fi.name,
+         fi.current_amount,
+         fi.max_amount,
+         rdt.request_document_type_name AS document_type
+  FROM fee_item fi
+  LEFT JOIN request_document_type rdt
+    ON rdt.request_document_type_id = fi.request_document_type_id
+  WHERE p_query IS NULL
+     OR fi.fee_code ILIKE '%'||p_query||'%'
+     OR fi.name     ILIKE '%'||p_query||'%'
+  ORDER BY fi.fee_code;
+$$;
+
+-- 8) Recent fee changes (unchanged)
+CREATE OR REPLACE FUNCTION get_recent_fee_changes(p_limit INT DEFAULT 50)
+RETURNS TABLE(changed_at TIMESTAMPTZ, fee_code TEXT, old_amount NUMERIC, new_amount NUMERIC, changed_by TEXT, reason TEXT)
+LANGUAGE sql AS $$
+  SELECT fcl.changed_at,
+         fi.fee_code,
+         fcl.old_amount,
+         fcl.new_amount,
+         COALESCE(ps.first_name||' '||ps.last_name,'') AS changed_by,
+         fcl.reason
+  FROM fee_change_log fcl
+  JOIN fee_item fi ON fi.fee_item_id = fcl.fee_item_id
+  LEFT JOIN staff s ON s.staff_id = fcl.changed_by_staff_id
+  LEFT JOIN person ps ON ps.person_id = s.person_id
+  ORDER BY fcl.changed_at DESC
+  LIMIT COALESCE(p_limit, 50);
+$$;
+
+-- 9) Bundle (unchanged API; now returns types from request_document_type)
+CREATE OR REPLACE FUNCTION get_lookup_bundle(p_person_id INT, p_document_type_id INT DEFAULT NULL)
+RETURNS JSONB
+LANGUAGE sql AS $$
+  WITH
+  dt AS (SELECT jsonb_agg(row_to_json(x)) AS js FROM (SELECT * FROM get_document_types()) x),
+  pm AS (SELECT jsonb_agg(row_to_json(x)) AS js FROM (SELECT * FROM get_payment_methods()) x),
+  rel AS (SELECT jsonb_agg(row_to_json(x)) AS js FROM (SELECT * FROM get_allowed_on_behalf_relationships()) x),
+  prof AS (SELECT to_jsonb(x) AS js FROM get_resident_profile_flags(p_person_id) x),
+  biz AS (SELECT jsonb_agg(row_to_json(x)) AS js FROM (SELECT * FROM get_businesses_owned_by_person(p_person_id)) x),
+  purp AS (
+    SELECT CASE WHEN p_document_type_id IS NULL THEN NULL
+                ELSE (SELECT jsonb_agg(row_to_json(x))
+                      FROM (SELECT * FROM get_purposes_by_document_type(p_document_type_id)) x)
+           END AS js)
+  SELECT jsonb_build_object(
+    'document_types', dt.js,
+    'payment_methods', pm.js,
+    'on_behalf_relationships', rel.js,
+    'resident_profile', prof.js,
+    'businesses', biz.js,
+    'purposes', purp.js
+  )
+  FROM dt, pm, rel, prof, biz, purp;
+$$;
+
+-- E) Business-rule helpers (no change required by request_document_type switch)
+
+-- Returns the amount to waive for ONE copy of a fee item for a person.
+-- Caller multiplies by quantity (as you already do).
+CREATE OR REPLACE FUNCTION compute_exemption_amount(
+  p_person_id   INT,
+  p_fee_item_id INT,
+  p_details     JSONB DEFAULT '{}'::jsonb
+) RETURNS NUMERIC
+LANGUAGE plpgsql AS $$
+DECLARE
+  v_fee       fee_item%ROWTYPE;
+  v_prog      TEXT;
+  v_is_senior BOOLEAN := FALSE;
+  v_ex        NUMERIC := 0;
+BEGIN
+  SELECT * INTO v_fee FROM fee_item WHERE fee_item_id = p_fee_item_id;
+  IF NOT FOUND THEN
+    RETURN 0;
+  END IF;
+
+  -- Resident program (PWD / INDIGENT / FIRST_TIME_JOBSEEKER, etc.)
+  SELECT upper(g.gov_mem_prog_name) INTO v_prog
+  FROM person p
+  LEFT JOIN government_membership_prog g ON g.gov_mem_prog_id = p.gov_mem_prog_id
+  WHERE p.person_id = p_person_id;
+
+  -- Senior flag by age
+  SELECT age(current_date, p.birthdate) >= interval '60 years'
+  INTO v_is_senior
+  FROM person p
+  WHERE p.person_id = p_person_id;
+
+  -- Apply full waivers based on fee flags
+  IF v_fee.exempt_ftj      AND v_prog = 'FIRST_TIME_JOBSEEKER' THEN v_ex := v_fee.current_amount; END IF;
+  IF v_fee.exempt_pwd      AND v_prog = 'PWD'                   THEN v_ex := v_fee.current_amount; END IF;
+  IF v_fee.exempt_indigent AND v_prog = 'INDIGENT'              THEN v_ex := v_fee.current_amount; END IF;
+  IF v_fee.exempt_senior   AND v_is_senior                      THEN v_ex := v_fee.current_amount; END IF;
+
+  -- Never exceed the fee itself
+  IF v_ex > v_fee.current_amount THEN
+    v_ex := v_fee.current_amount;
+  END IF;
+
+  RETURN COALESCE(v_ex, 0);
+END
+$$;
+
+-- Offense % helper (unchanged)
+CREATE OR REPLACE FUNCTION get_surcharge_percent(
+  p_fee_item_id INT,
+  p_offense_no  INT
+) RETURNS NUMERIC
+LANGUAGE sql AS $$
+  SELECT COALESCE(
+           (SELECT percent
+              FROM surcharge_rule
+             WHERE fee_item_id = p_fee_item_id
+               AND offense_no  = p_offense_no),
+           0
+         );
+$$;
+
+-- Helpful index (if not created in B)
+CREATE INDEX IF NOT EXISTS ix_surcharge_fee_offense
+  ON surcharge_rule(fee_item_id, offense_no);
+
+
+-- F) Logging via your common_log  (no change required by request_document_type switch)
+
+-- Ensure keys exist (idempotent)
+CREATE UNIQUE INDEX IF NOT EXISTS uq_user_type_name ON user_type(user_type_name);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_log_subsystem_name ON log_subsystem(log_subsystem_name);
+
+INSERT INTO user_type(user_type_name)
+SELECT unnest(ARRAY['STAFF','RESIDENT','SYSTEM'])
+ON CONFLICT (user_type_name) DO NOTHING;
+
+INSERT INTO log_subsystem(log_subsystem_name)
+VALUES ('DOCUMENTS')
+ON CONFLICT (log_subsystem_name) DO NOTHING;
+
+-- Optional: helpful indexes for fast timelines & per-record lookups
+CREATE INDEX IF NOT EXISTS ix_common_log_subsys_dt
+  ON common_log (subsystem, date_time DESC);
+
+CREATE INDEX IF NOT EXISTS ix_common_log_table_rec_dt
+  ON common_log (table_affected, record_affected_id, date_time DESC);
+
+-- Logger helper (writes JSON details as text into your common_log.details TEXT column)
+CREATE OR REPLACE FUNCTION doc_log_event(
+  p_action              TEXT,
+  p_table_affected      TEXT,
+  p_record_affected_id  INT,
+  p_details             JSONB DEFAULT '{}'::jsonb,
+  p_performer_staff_id  INT  DEFAULT NULL,
+  p_performer_person_id INT  DEFAULT NULL,
+  p_field_changed       TEXT DEFAULT NULL,
+  p_old_value           TEXT DEFAULT NULL,
+  p_new_value           TEXT DEFAULT NULL
+) RETURNS VOID
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_subsys_id INT := (
+    SELECT log_subsystem_id
+    FROM log_subsystem
+    WHERE log_subsystem_name = 'DOCUMENTS'
+    LIMIT 1
+  );
+  v_ut_id     INT;
+  v_perf      INT;
+BEGIN
+  -- Safety: if subsystem row got deleted, recreate and re-read
+  IF v_subsys_id IS NULL THEN
+    INSERT INTO log_subsystem(log_subsystem_name)
+    VALUES ('DOCUMENTS')
+    ON CONFLICT (log_subsystem_name) DO NOTHING;
+
+    SELECT log_subsystem_id
+    INTO v_subsys_id
+    FROM log_subsystem
+    WHERE log_subsystem_name = 'DOCUMENTS'
+    LIMIT 1;
+  END IF;
+
+  IF p_performer_staff_id IS NOT NULL THEN
+    v_ut_id := (SELECT user_type_id FROM user_type WHERE user_type_name='STAFF' LIMIT 1);
+    v_perf  := p_performer_staff_id;
+  ELSIF p_performer_person_id IS NOT NULL THEN
+    v_ut_id := (SELECT user_type_id FROM user_type WHERE user_type_name='RESIDENT' LIMIT 1);
+    v_perf  := p_performer_person_id;
+  ELSE
+    v_ut_id := (SELECT user_type_id FROM user_type WHERE user_type_name='SYSTEM' LIMIT 1);
+    v_perf  := 0;  -- no FK; 0 denotes system actor
+  END IF;
+
+  INSERT INTO common_log(
+    record_affected_id,
+    details,
+    table_affected,
+    action,
+    field_changed,
+    old_value,
+    new_value,
+    performer_id,
+    user_type_id,
+    subsystem
+  ) VALUES (
+    p_record_affected_id,
+    COALESCE(p_details, '{}'::jsonb)::text,
+    p_table_affected,
+    p_action,
+    p_field_changed,
+    p_old_value,
+    p_new_value,
+    v_perf,
+    v_ut_id,
+    v_subsys_id
+  );
+END
+$$;
+
+
+-- ============================ G =============================
+CREATE OR REPLACE FUNCTION create_document_request(
+  p_requested_by    INT,
+  p_on_behalf_of    INT,
+  p_is_on_behalf    BOOLEAN,
+  p_business_id     INT,
+  p_purpose_notes   TEXT,
+  p_lines           JSONB   -- array of items; each item may be:
+                            --   { "document_purpose_id": 123, "quantity": 1, "details": {...}, "offense_no": 1 }
+                            -- or{ "fee_code": "CLR_EMPLOYMENT", "quantity": 1, "details": {...}, "offense_no": 1 }
+) RETURNS INT
+LANGUAGE plpgsql AS $$
+DECLARE
+  v_hdr_id       INT;
+  v_status_id    INT := (SELECT request_status_id
+                         FROM request_status
+                         WHERE request_status_name='FOR_TREASURER_REVIEW' LIMIT 1);
+  v_row          JSONB;
+
+  -- resolved per line
+  v_fee_id       INT;
+  v_qty          INT;
+  v_base         NUMERIC;
+  v_waive        NUMERIC;
+  v_surch        NUMERIC;
+  v_total        NUMERIC;
+
+  v_offense      INT;
+  v_def_offense  INT;
+  v_def_details  JSONB;
+  v_details      JSONB;
+  v_line_id      INT;
+BEGIN
+  -- On-behalf validation (keep stricter rule; or swap to lighter kin-only variant if you chose that earlier)
+  IF p_is_on_behalf AND p_on_behalf_of IS NOT NULL THEN
+    IF NOT EXISTS (
+      SELECT 1
+      FROM person_kinship k
+      WHERE k.src_person_id = p_requested_by
+        AND k.dst_person_id = p_on_behalf_of
+        AND k.is_active = TRUE
+        AND EXISTS (SELECT 1
+                    FROM allowed_on_behalf_relationship a
+                    WHERE a.relationship_id = k.relationship_id)
+    ) THEN
+      RAISE EXCEPTION 'Requester is not allowed to file on behalf of this person';
+    END IF;
+  END IF;
+
+  -- Create header
+  INSERT INTO doc_request_hdr(
+    requested_by_person_id, on_behalf_of_person_id, is_on_behalf,
+    business_id, purpose_notes, request_status_id
+  )
+  VALUES (p_requested_by, p_on_behalf_of, p_is_on_behalf,
+          p_business_id, p_purpose_notes, v_status_id)
+  RETURNING doc_request_id INTO v_hdr_id;
+
+  PERFORM doc_log_event(
+    'REQUEST_CREATED','doc_request_hdr',v_hdr_id,
+    jsonb_build_object(
+      'requested_by',  p_requested_by,
+      'on_behalf_of',  p_on_behalf_of,
+      'business_id',   p_business_id,
+      'purpose_notes', p_purpose_notes
+    ),
+    NULL, p_requested_by
+  );
+
+  -- Lines
+  FOR v_row IN SELECT * FROM jsonb_array_elements(p_lines)
+  LOOP
+    v_fee_id      := NULL;
+    v_def_details := NULL;
+    v_def_offense := NULL;
+
+    -- Prefer: resolve by document_purpose_id
+    IF (v_row ? 'document_purpose_id') THEN
+      SELECT dp.fee_item_id, dp.default_details, dp.default_offense_no
+      INTO   v_fee_id,    v_def_details,  v_def_offense
+      FROM document_purpose dp
+      WHERE dp.document_purpose_id = (v_row->>'document_purpose_id')::INT;
+
+      IF v_fee_id IS NULL THEN
+        RAISE EXCEPTION 'Unknown document_purpose_id: %', (v_row->>'document_purpose_id');
+      END IF;
+
+    -- Fallback: resolve by fee_code (back-compat)
+    ELSIF (v_row ? 'fee_code') THEN
+      SELECT fi.fee_item_id
+      INTO   v_fee_id
+      FROM fee_item fi
+      WHERE fi.fee_code = (v_row->>'fee_code');
+
+      IF v_fee_id IS NULL THEN
+        RAISE EXCEPTION 'Unknown fee_code: %', (v_row->>'fee_code');
+      END IF;
+    ELSE
+      RAISE EXCEPTION 'Line must include document_purpose_id or fee_code';
+    END IF;
+
+    -- Ensure fee item is active
+    IF NOT EXISTS (SELECT 1 FROM fee_item WHERE fee_item_id=v_fee_id AND is_active) THEN
+      RAISE EXCEPTION 'Fee item is not active.';
+    END IF;
+
+    v_qty := COALESCE( (v_row->>'quantity')::INT, 1 );
+    IF v_qty <= 0 THEN
+      RAISE EXCEPTION 'Quantity must be > 0';
+    END IF;
+
+    -- Merge details: default_details (from purpose) < overridden details (from UI)
+    v_details := COALESCE(v_def_details, '{}'::jsonb) || COALESCE(v_row->'details','{}'::jsonb);
+
+    -- Offense: explicit from UI or default from purpose
+    v_offense := COALESCE(NULLIF(v_row->>'offense_no','')::INT, v_def_offense);
+
+    -- Base calc for the entire line (quantity copies)
+    v_base  := (SELECT current_amount FROM fee_item WHERE fee_item_id=v_fee_id) * v_qty;
+
+    -- Waiver for the person (one copy) * quantity
+    v_waive := compute_exemption_amount(COALESCE(p_on_behalf_of, p_requested_by),
+                                        v_fee_id,
+                                        v_details) * v_qty;
+
+    -- Surcharge on net base (after waiver), if any offense
+    v_surch := CASE WHEN v_offense IS NOT NULL THEN
+                (v_base - v_waive) * (get_surcharge_percent(v_fee_id, v_offense) / 100.0)
+              ELSE 0 END;
+
+    v_total := GREATEST(v_base - v_waive + v_surch, 0);
+
+    INSERT INTO doc_request_line(
+      doc_request_id, fee_item_id, quantity,
+      base_amount, waived_amount, surcharge_amount, line_total, details
+    )
+    VALUES (
+      v_hdr_id, v_fee_id, v_qty,
+      v_base,   v_waive,  v_surch,          v_total,   v_details
+    )
+    RETURNING doc_request_line_id INTO v_line_id;
+
+    PERFORM doc_log_event(
+      'LINE_ADDED','doc_request_line',v_line_id,
+      jsonb_build_object(
+        'doc_request_id', v_hdr_id,
+        'fee_item_id',    v_fee_id,
+        'qty',            v_qty,
+        'offense_no',     v_offense,
+        'line_total',     v_total
+      ),
+      NULL, p_requested_by
+    );
+  END LOOP;
+
+  RETURN v_hdr_id;
+END
+$$;
+
+
+-- Amount due (unchanged)
+CREATE OR REPLACE FUNCTION get_request_amount_due(p_doc_request_id INT)
+RETURNS NUMERIC
+LANGUAGE sql AS $$
+  SELECT COALESCE(SUM(line_total),0) FROM doc_request_line WHERE doc_request_id=p_doc_request_id;
+$$;
+
+-- Accept payment (unchanged)
+CREATE OR REPLACE FUNCTION treasurer_accept_payment(
+  p_doc_request_id INT,
+  p_payment_method_id INT,
+  p_received_by_staff_id INT,
+  p_amount_paid NUMERIC,
+  p_or_number TEXT DEFAULT NULL
+) RETURNS INT
+LANGUAGE plpgsql AS $$
+DECLARE
+  v_due NUMERIC;
+  v_change NUMERIC;
+  v_or_id INT;
+  v_or_num TEXT;
+  v_paid_status INT := (SELECT request_status_id FROM request_status WHERE request_status_name='PAID' LIMIT 1);
+BEGIN
+  v_due := get_request_amount_due(p_doc_request_id);
+  IF p_amount_paid < v_due THEN
+    RAISE EXCEPTION 'Amount paid (%.2f) is less than amount due (%.2f)', p_amount_paid, v_due;
+  END IF;
+  v_change := p_amount_paid - v_due;
+  v_or_num := COALESCE(p_or_number, make_or_number());
+
+  INSERT INTO official_receipt(or_number,issued_by_staff_id,doc_request_id,payment_method_id,amount_due,amount_paid,change_due)
+  VALUES (v_or_num, p_received_by_staff_id, p_doc_request_id, p_payment_method_id, v_due, p_amount_paid, v_change)
+  RETURNING or_id INTO v_or_id;
+
+  PERFORM doc_log_event(
+    'PAYMENT_ACCEPTED','official_receipt',v_or_id,
+    jsonb_build_object('doc_request_id',p_doc_request_id,'or_number',v_or_num,'payment_method_id',p_payment_method_id,'amount_due',v_due,'amount_paid',p_amount_paid,'change_due',v_change),
+    p_received_by_staff_id, NULL
+  );
+
+  UPDATE doc_request_hdr
+     SET request_status_id=v_paid_status, current_status_set_at=now()
+   WHERE doc_request_id=p_doc_request_id;
+
+  PERFORM doc_log_event(
+    'STATUS_CHANGED','doc_request_hdr',p_doc_request_id,
+    jsonb_build_object('to_status','PAID'),
+    p_received_by_staff_id, NULL
+  );
+
+  RETURN v_or_id;
+END $$;
+
+-- Forward to printing (unchanged)
+CREATE OR REPLACE FUNCTION forward_to_clerk_for_printing(p_doc_request_id INT)
+RETURNS VOID
+LANGUAGE plpgsql AS $$
+DECLARE v_stat INT := (SELECT request_status_id FROM request_status WHERE request_status_name='FOR_PRINTING' LIMIT 1);
+BEGIN
+  UPDATE doc_request_hdr SET request_status_id=v_stat, current_status_set_at=now()
+  WHERE doc_request_id=p_doc_request_id;
+
+  PERFORM doc_log_event(
+    'STATUS_CHANGED','doc_request_hdr',p_doc_request_id,
+    jsonb_build_object('to_status','FOR_PRINTING')
+  );
+END $$;
+
+-- Release (unchanged)
+CREATE OR REPLACE FUNCTION mark_request_released(p_doc_request_id INT)
+RETURNS VOID
+LANGUAGE plpgsql AS $$
+DECLARE v_stat INT := (SELECT request_status_id FROM request_status WHERE request_status_name='RELEASED' LIMIT 1);
+BEGIN
+  UPDATE doc_request_hdr SET request_status_id=v_stat, current_status_set_at=now()
+  WHERE doc_request_id=p_doc_request_id;
+
+  PERFORM doc_log_event(
+    'STATUS_CHANGED','doc_request_hdr',p_doc_request_id,
+    jsonb_build_object('to_status','RELEASED')
+  );
+END $$;
+
+-- Update fee (unchanged)
+CREATE OR REPLACE FUNCTION treasurer_update_fee_amount(
+  p_fee_code TEXT,
+  p_new_amount NUMERIC,
+  p_changed_by_staff_id INT,
+  p_reason TEXT DEFAULT NULL
+) RETURNS VOID
+LANGUAGE plpgsql AS $$
+DECLARE
+  v_item fee_item%ROWTYPE;
+BEGIN
+  SELECT * INTO v_item FROM fee_item WHERE fee_code=p_fee_code FOR UPDATE;
+  IF NOT FOUND THEN RAISE EXCEPTION 'Unknown fee_code: %', p_fee_code; END IF;
+  IF v_item.max_amount IS NOT NULL AND p_new_amount > v_item.max_amount THEN
+    RAISE EXCEPTION 'New amount (%.2f) exceeds ceiling (%.2f)', p_new_amount, v_item.max_amount;
+  END IF;
+
+  INSERT INTO fee_change_log(fee_item_id, old_amount, new_amount, changed_by_staff_id, reason)
+  VALUES (v_item.fee_item_id, v_item.current_amount, p_new_amount, p_changed_by_staff_id, p_reason);
+
+  UPDATE fee_item SET current_amount=p_new_amount WHERE fee_item_id=v_item.fee_item_id;
+
+  PERFORM doc_log_event(
+    'FEE_UPDATED','fee_item',v_item.fee_item_id,
+    jsonb_build_object('fee_code',v_item.fee_code,'old_amount',v_item.current_amount,'new_amount',p_new_amount,'reason',p_reason),
+    p_changed_by_staff_id, NULL,
+    'current_amount', v_item.current_amount::text, p_new_amount::text
+  );
+END $$;
+
+-- ================================================= H =======================================
+-- List with doc types, purposes, copies, and payment summary
+CREATE OR REPLACE VIEW v_doc_request_list_ex AS
+SELECT
+  h.doc_request_id,
+  h.request_code,
+  rs.request_status_name AS status,
+  to_char(h.created_at AT TIME ZONE 'Asia/Manila','YYYY-MM-DD HH24:MI') AS created_at,
+  rb.first_name||' '||rb.last_name AS requested_by,
+  COALESCE(ob.first_name||' '||ob.last_name,'') AS on_behalf_of,
+  COALESCE(SUM(l.line_total),0) AS amount_due,
+  COALESCE(SUM(l.quantity),0)   AS total_copies,
+
+  -- distinct list of request document types in this request
+  ARRAY_REMOVE(ARRAY_AGG(DISTINCT rdt.request_document_type_name), NULL) AS doc_types,
+
+  -- distinct list of purposes captured in details
+  ARRAY_REMOVE(ARRAY_AGG(DISTINCT (l.details->>'purpose_code')), NULL)   AS purposes,
+
+  -- payment rollup
+  COALESCE(pay.total_paid,0)   AS total_paid,
+  pay.latest_or_number,
+  pay.latest_or_time
+FROM doc_request_hdr h
+LEFT JOIN request_status rs ON rs.request_status_id = h.request_status_id
+LEFT JOIN person rb ON rb.person_id = h.requested_by_person_id
+LEFT JOIN person ob ON ob.person_id = h.on_behalf_of_person_id
+LEFT JOIN doc_request_line l ON l.doc_request_id = h.doc_request_id
+LEFT JOIN fee_item fi ON fi.fee_item_id = l.fee_item_id
+LEFT JOIN request_document_type rdt ON rdt.request_document_type_id = fi.request_document_type_id
+LEFT JOIN LATERAL (
+  SELECT SUM(o.amount_paid) AS total_paid,
+         MAX(o.issued_at)   AS latest_or_time,
+         (ARRAY_AGG(o.or_number ORDER BY o.issued_at DESC))[1] AS latest_or_number
+  FROM official_receipt o
+  WHERE o.doc_request_id = h.doc_request_id
+) pay ON TRUE
+GROUP BY h.doc_request_id, h.request_code, rs.request_status_name, h.created_at,
+         requested_by, on_behalf_of, pay.total_paid, pay.latest_or_number, pay.latest_or_time
+ORDER BY h.created_at DESC;
+
+-- Detail lines with fee/purpose/type (great for the Clerk/Treasurer detail page)
+CREATE OR REPLACE VIEW v_doc_request_detail_lines AS
+SELECT
+  l.doc_request_line_id,
+  l.doc_request_id,
+  fi.fee_code,
+  fi.name                AS fee_name,
+  rdt.request_document_type_name AS document_type_name,
+  (l.details->>'purpose_code')    AS purpose_code,
+  l.quantity,
+  l.base_amount,
+  l.waived_amount,
+  l.surcharge_amount,
+  l.line_total,
+  l.details
+FROM doc_request_line l
+JOIN fee_item fi ON fi.fee_item_id = l.fee_item_id
+LEFT JOIN request_document_type rdt
+  ON rdt.request_document_type_id = fi.request_document_type_id
+ORDER BY l.doc_request_line_id;
+
+-- Optional: OR/Payment summary per request
+CREATE OR REPLACE VIEW v_doc_request_payments AS
+SELECT
+  o.doc_request_id,
+  COUNT(*)                      AS or_count,
+  SUM(o.amount_paid)            AS total_paid,
+  (ARRAY_AGG(o.or_number ORDER BY o.issued_at DESC))[1] AS latest_or_number,
+  MAX(o.issued_at)              AS latest_or_time
+FROM official_receipt o
+GROUP BY o.doc_request_id;
+
+select * from person;
+
+select * from staff;
+
+-- views
+
+-- v_doc_request_list (aggregated with joins)
+CREATE OR REPLACE VIEW public.v_doc_request_list AS
+SELECT
+  h.doc_request_id,
+  h.request_code,
+  rs.request_status_name AS status,
+  to_char(h.created_at AT TIME ZONE 'Asia/Manila','YYYY-MM-DD HH24:MI') AS created_at,
+  rb.first_name || ' ' || rb.last_name AS requested_by,
+  COALESCE(ob.first_name || ' ' || ob.last_name, '') AS on_behalf_of,
+  COALESCE(SUM(l.line_total),0) AS amount_due
+FROM public.doc_request_hdr h
+LEFT JOIN public.request_status rs ON rs.request_status_id = h.request_status_id
+LEFT JOIN public.person rb ON rb.person_id = h.requested_by_person_id
+LEFT JOIN public.person ob ON ob.person_id = h.on_behalf_of_person_id
+LEFT JOIN public.doc_request_line l ON l.doc_request_id = h.doc_request_id
+GROUP BY h.doc_request_id, h.request_code, rs.request_status_name, h.created_at, requested_by, on_behalf_of
+ORDER BY h.created_at DESC;
+
+-- v_doc_request_detail
+CREATE OR REPLACE VIEW public.v_doc_request_detail AS
+SELECT
+  h.doc_request_id,
+  h.request_code,
+  h.created_at,
+  rs.request_status_name AS status,
+  rb.person_id AS requested_by_id,
+  rb.first_name || ' ' || rb.last_name AS requested_by,
+  ob.person_id AS on_behalf_id,
+  COALESCE(ob.first_name || ' ' || ob.last_name, '') AS on_behalf_of,
+  h.purpose_notes,
+  COALESCE(SUM(l.line_total),0) AS amount_due
+FROM public.doc_request_hdr h
+LEFT JOIN public.request_status rs ON rs.request_status_id = h.request_status_id
+LEFT JOIN public.person rb ON rb.person_id = h.requested_by_person_id
+LEFT JOIN public.person ob ON ob.person_id = h.on_behalf_of_person_id
+LEFT JOIN public.doc_request_line l ON l.doc_request_id = h.doc_request_id
+GROUP BY h.doc_request_id, h.request_code, h.created_at, rs.request_status_name,
+         rb.person_id, requested_by, ob.person_id, on_behalf_of, h.purpose_notes;
+
+-- v_document_timeline
+CREATE OR REPLACE VIEW public.v_document_timeline AS
+SELECT
+  cl.common_log_id,
+  cl.date_time AS occurred_at,
+  cl.action,
+  cl.table_affected,
+  cl.record_affected_id,
+  cl.details::jsonb AS details,
+  ut.user_type_name,
+  cl.performer_id,
+  COALESCE(CASE WHEN ut.user_type_name='STAFF'    THEN ps.first_name||' '||ps.last_name END, '') AS staff_name,
+  COALESCE(CASE WHEN ut.user_type_name='RESIDENT' THEN pr.first_name||' '||pr.last_name END, '') AS resident_name
+FROM public.common_log cl
+JOIN public.log_subsystem ls
+  ON ls.log_subsystem_id = cl.subsystem
+ AND ls.log_subsystem_name='DOCUMENTS'
+LEFT JOIN public.user_type ut ON ut.user_type_id = cl.user_type_id
+LEFT JOIN public.staff s      ON (ut.user_type_name='STAFF'    AND s.staff_id = cl.performer_id)
+LEFT JOIN public.person ps    ON ps.person_id = s.person_id
+LEFT JOIN public.person pr    ON (ut.user_type_name='RESIDENT' AND pr.person_id = cl.performer_id)
+ORDER BY cl.date_time DESC, cl.common_log_id DESC;
+
+-- (nice-to-have) detail lines view
+CREATE OR REPLACE VIEW public.v_doc_request_detail_lines AS
+SELECT
+  l.doc_request_line_id,
+  l.doc_request_id,
+  fi.fee_code,
+  fi.name AS fee_name,
+  rdt.request_document_type_name AS document_type_name,
+  (l.details->>'purpose_code') AS purpose_code,
+  l.quantity,
+  l.base_amount,
+  l.waived_amount,
+  l.surcharge_amount,
+  l.line_total,
+  l.details
+FROM public.doc_request_line l
+JOIN public.fee_item fi ON fi.fee_item_id = l.fee_item_id
+LEFT JOIN public.request_document_type rdt
+  ON rdt.request_document_type_id = fi.request_document_type_id
+ORDER BY l.doc_request_line_id;
+
+-- (nice-to-have) payment summary
+CREATE OR REPLACE VIEW public.v_doc_request_payments AS
+SELECT
+  o.doc_request_id,
+  COUNT(*) AS or_count,
+  SUM(o.amount_paid) AS total_paid,
+  (ARRAY_AGG(o.or_number ORDER BY o.issued_at DESC))[1] AS latest_or_number,
+  MAX(o.issued_at) AS latest_or_time
+FROM public.official_receipt o
+GROUP BY o.doc_request_id;
+
+
+-- add views
+
 SELECT schemaname, viewname
 FROM pg_views
 WHERE viewname IN (
@@ -98,71 +1021,64 @@ WHERE viewname IN (
 ORDER BY schemaname, viewname;
 
 
--- replace :requester_id and :subject_id
-SELECT *
-FROM person_kinship pk
-WHERE (pk.src_person_id = 181 AND pk.dst_person_id = 4)
+-- v_doc_request_list (aggregated with joins)
+CREATE OR REPLACE VIEW public.v_doc_request_list AS
+SELECT
+  h.doc_request_id,
+  h.request_code,
+  rs.request_status_name AS status,
+  to_char(h.created_at AT TIME ZONE 'Asia/Manila','YYYY-MM-DD HH24:MI') AS created_at,
+  rb.first_name || ' ' || rb.last_name AS requested_by,
+  COALESCE(ob.first_name || ' ' || ob.last_name, '') AS on_behalf_of,
+  COALESCE(SUM(l.line_total),0) AS amount_due
+FROM public.doc_request_hdr h
+LEFT JOIN public.request_status rs ON rs.request_status_id = h.request_status_id
+LEFT JOIN public.person rb ON rb.person_id = h.requested_by_person_id
+LEFT JOIN public.person ob ON ob.person_id = h.on_behalf_of_person_id
+LEFT JOIN public.doc_request_line l ON l.doc_request_id = h.doc_request_id
+GROUP BY h.doc_request_id, h.request_code, rs.request_status_name, h.created_at, requested_by, on_behalf_of
+ORDER BY h.created_at DESC;
 
-SELECT relationship_id, relationship_name, code
-FROM relationship
-WHERE code IN ('MOTHER','FATHER','GUARDIAN','SPOUSE','CHILD','WARD');  -- adjust to your codes
+-- v_doc_request_detail
+CREATE OR REPLACE VIEW public.v_doc_request_detail AS
+SELECT
+  h.doc_request_id,
+  h.request_code,
+  h.created_at,
+  rs.request_status_name AS status,
+  rb.person_id AS requested_by_id,
+  rb.first_name || ' ' || rb.last_name AS requested_by,
+  ob.person_id AS on_behalf_id,
+  COALESCE(ob.first_name || ' ' || ob.last_name, '') AS on_behalf_of,
+  h.purpose_notes,
+  COALESCE(SUM(l.line_total),0) AS amount_due
+FROM public.doc_request_hdr h
+LEFT JOIN public.request_status rs ON rs.request_status_id = h.request_status_id
+LEFT JOIN public.person rb ON rb.person_id = h.requested_by_person_id
+LEFT JOIN public.person ob ON ob.person_id = h.on_behalf_of_person_id
+LEFT JOIN public.doc_request_line l ON l.doc_request_id = h.doc_request_id
+GROUP BY h.doc_request_id, h.request_code, h.created_at, rs.request_status_name,
+         rb.person_id, requested_by, ob.person_id, on_behalf_of, h.purpose_notes;
 
-
-
-
--- Which fee items would be fully/partially waived for this person?
-WITH subject AS (
-  SELECT p.person_id,
-         p.birthdate,
-         (age(current_date, p.birthdate) >= interval '60 years') AS is_senior,
-         upper(g.gov_mem_prog_name) AS program
-  FROM person p
-  LEFT JOIN government_membership_prog g
-    ON g.gov_mem_prog_id = p.gov_mem_prog_id
-  WHERE p.person_id = 4
-),
-calc AS (
-  SELECT fi.fee_item_id, fi.fee_code, fi.name, fi.current_amount,
-         fi.exempt_ftj, fi.exempt_senior, fi.exempt_pwd, fi.exempt_indigent,
-         s.is_senior, s.program,
-         compute_exemption_amount(s.person_id, fi.fee_item_id, '{}'::jsonb) AS waive_one_copy
-  FROM fee_item fi
-  CROSS JOIN subject s
-)
-SELECT fee_code, name, current_amount,
-       exempt_ftj, exempt_senior, exempt_pwd, exempt_indigent,
-       program AS gov_program, is_senior,
-       waive_one_copy,
-       CASE WHEN waive_one_copy >= current_amount THEN 'FULLY WAIVED'
-            WHEN waive_one_copy > 0 THEN 'PARTIAL'
-            ELSE 'PAYABLE'
-       END AS status
-FROM calc
-ORDER BY fee_code;
-
-
--- List existing request lines that ended up at ₱0 total
-SELECT h.request_code,
-       to_char(h.created_at AT TIME ZONE 'Asia/Manila','YYYY-MM-DD HH24:MI') AS created_at,
-       rb.first_name || ' ' || rb.last_name AS requested_by,
-       COALESCE(ob.first_name || ' ' || ob.last_name,'') AS on_behalf_of,
-       fi.fee_code,
-       l.quantity,
-       l.base_amount,
-       l.waived_amount,
-       l.surcharge_amount,
-       l.line_total
-FROM doc_request_line l
-JOIN doc_request_hdr h ON h.doc_request_id = l.doc_request_id
-JOIN fee_item fi ON fi.fee_item_id = l.fee_item_id
-LEFT JOIN person rb ON rb.person_id = h.requested_by_person_id
-LEFT JOIN person ob ON ob.person_id = h.on_behalf_of_person_id
-WHERE l.line_total = 0
-ORDER BY h.created_at DESC
-LIMIT 100;
-
-
-SELECT fee_code, name, current_amount,
-       exempt_ftj, exempt_senior, exempt_pwd, exempt_indigent
-FROM fee_item
-ORDER BY fee_code;
+-- v_document_timeline
+CREATE OR REPLACE VIEW public.v_document_timeline AS
+SELECT
+  cl.common_log_id,
+  cl.date_time AS occurred_at,
+  cl.action,
+  cl.table_affected,
+  cl.record_affected_id,
+  cl.details::jsonb AS details,
+  ut.user_type_name,
+  cl.performer_id,
+  COALESCE(CASE WHEN ut.user_type_name='STAFF'    THEN ps.first_name||' '||ps.last_name END, '') AS staff_name,
+  COALESCE(CASE WHEN ut.user_type_name='RESIDENT' THEN pr.first_name||' '||pr.last_name END, '') AS resident_name
+FROM public.common_log cl
+JOIN public.log_subsystem ls
+  ON ls.log_subsystem_id = cl.subsystem
+ AND ls.log_subsystem_name='DOCUMENTS'
+LEFT JOIN public.user_type ut ON ut.user_type_id = cl.user_type_id
+LEFT JOIN public.staff s      ON (ut.user_type_name='STAFF'    AND s.staff_id = cl.performer_id)
+LEFT JOIN public.person ps    ON ps.person_id = s.person_id
+LEFT JOIN public.person pr    ON (ut.user_type_name='RESIDENT' AND pr.person_id = cl.performer_id)
+ORDER BY cl.date_time DESC, cl.common_log_id DESC;
