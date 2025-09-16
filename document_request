@@ -1,4 +1,4 @@
--- RAP DOCUMENT REQUEST QUERY
+-- RAP GITHUB: DOCUMENT REQUEST QUERY
 -- Added some in request_status table
 INSERT INTO request_status (request_status_name)
 SELECT unnest(ARRAY['FOR_TREASURER_REVIEW','PAID','FOR_PRINTING','RELEASED'])
@@ -56,7 +56,6 @@ SELECT unnest(ARRAY[
   'BARANGAY BUSINESS CLEARANCE'
 ])
 ON CONFLICT (request_document_type_name) DO NOTHING;
-
 
 
 -- B. Fees, surcharge ladder, purposes
@@ -563,86 +562,157 @@ END
 $$;
 
 
--- ============================ G =============================
-CREATE OR REPLACE FUNCTION create_document_request(
+-- RAP TEST: UPDATE NEW QUERY
+-- ============================ G (hardened) =============================
+-- =====================================================================
+-- create_document_request  (no relationship_inverse table required)
+-- Authorizes on-behalf using:
+--   • direct edge: requester → subject ∈ allowed_on_behalf_relationship
+--   • inverse edge: subject   → requester ∈ v_inverse_ok_ids (e.g., CHILD/SON/DAUGHTER)
+-- =====================================================================
+CREATE OR REPLACE FUNCTION public.create_document_request(
   p_requested_by    INT,
   p_on_behalf_of    INT,
   p_is_on_behalf    BOOLEAN,
   p_business_id     INT,
   p_purpose_notes   TEXT,
-  p_lines           JSONB   -- array of items; each item may be:
+  p_lines           JSONB   -- array; each item:
                             --   { "document_purpose_id": 123, "quantity": 1, "details": {...}, "offense_no": 1 }
                             -- or{ "fee_code": "CLR_EMPLOYMENT", "quantity": 1, "details": {...}, "offense_no": 1 }
 ) RETURNS INT
-LANGUAGE plpgsql AS $$
+LANGUAGE plpgsql
+AS $$
 DECLARE
   v_hdr_id       INT;
-  v_status_id    INT := (SELECT request_status_id
-                         FROM request_status
-                         WHERE request_status_name='FOR_TREASURER_REVIEW' LIMIT 1);
+  v_status_id    INT := (
+    SELECT request_status_id
+    FROM request_status
+    WHERE request_status_name = 'FOR_TREASURER_REVIEW'
+    LIMIT 1
+  );
+
+  -- Normalize subject + flag
+  v_subject_id   INT;
+  v_is_on_behalf BOOLEAN;
+
   v_row          JSONB;
 
-  -- resolved per line
+  -- per-line resolution
   v_fee_id       INT;
   v_qty          INT;
-  v_base         NUMERIC;
-  v_waive        NUMERIC;
-  v_surch        NUMERIC;
-  v_total        NUMERIC;
+  v_base         NUMERIC := 0;
+  v_waive        NUMERIC := 0;
+  v_surch        NUMERIC := 0;
+  v_total        NUMERIC := 0;
 
   v_offense      INT;
   v_def_offense  INT;
   v_def_details  JSONB;
   v_details      JSONB;
   v_line_id      INT;
+
+  -- 👇 Tune these to your schema:
+  -- relationship_id list considered valid when edge is SUBJECT -> REQUESTER
+  -- Based on your list: 7=CHILD, 8=SON, 9=DAUGHTER (add WARD/DEPENDENT if you have them)
+  v_inverse_ok_ids int[] := ARRAY[3, 4, 5, 7];
 BEGIN
-  -- On-behalf validation (keep stricter rule; or swap to lighter kin-only variant if you chose that earlier)
-  IF p_is_on_behalf AND p_on_behalf_of IS NOT NULL THEN
-    IF NOT EXISTS (
-      SELECT 1
-      FROM person_kinship k
-      WHERE k.src_person_id = p_requested_by
-        AND k.dst_person_id = p_on_behalf_of
-        AND k.is_active = TRUE
-        AND EXISTS (SELECT 1
-                    FROM allowed_on_behalf_relationship a
-                    WHERE a.relationship_id = k.relationship_id)
-    ) THEN
+  -- ------------------ Normalize self vs on-behalf ------------------
+  v_is_on_behalf := (p_is_on_behalf IS TRUE
+                     AND p_on_behalf_of IS NOT NULL
+                     AND p_on_behalf_of <> p_requested_by);
+
+  v_subject_id := CASE WHEN v_is_on_behalf THEN p_on_behalf_of ELSE p_requested_by END;
+
+  -- ------------------ Safety checks ------------------
+  IF v_status_id IS NULL THEN
+    RAISE EXCEPTION 'Missing request status: FOR_TREASURER_REVIEW';
+  END IF;
+
+  PERFORM 1 FROM person WHERE person_id = p_requested_by;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Requester not found: %', p_requested_by;
+  END IF;
+
+  PERFORM 1 FROM person WHERE person_id = v_subject_id;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Subject not found: %', v_subject_id;
+  END IF;
+
+  IF p_lines IS NULL OR jsonb_typeof(p_lines) <> 'array' OR jsonb_array_length(p_lines) = 0 THEN
+    RAISE EXCEPTION 'p_lines must be a non-empty JSON array';
+  END IF;
+
+  -- ------------------ On-behalf authorization ------------------
+  IF v_is_on_behalf THEN
+    IF NOT (
+         -- Case A: requester -> subject has an allowed relationship (parent/guardian/spouse etc.)
+         EXISTS (
+           SELECT 1
+           FROM person_kinship k
+           JOIN allowed_on_behalf_relationship a
+             ON a.relationship_id = k.relationship_id
+           WHERE k.is_active
+             AND k.src_person_id = p_requested_by
+             AND k.dst_person_id = v_subject_id
+         )
+         OR
+         -- Case B: subject -> requester has an inverse-OK relationship (child/son/daughter/etc.)
+         EXISTS (
+           SELECT 1
+           FROM person_kinship k
+           WHERE k.is_active
+             AND k.src_person_id = v_subject_id
+             AND k.dst_person_id = p_requested_by
+             AND k.relationship_id = ANY (v_inverse_ok_ids)
+         )
+       ) THEN
       RAISE EXCEPTION 'Requester is not allowed to file on behalf of this person';
     END IF;
   END IF;
 
-  -- Create header
+  -- ------------------ Create header ------------------
   INSERT INTO doc_request_hdr(
-    requested_by_person_id, on_behalf_of_person_id, is_on_behalf,
-    business_id, purpose_notes, request_status_id
+    requested_by_person_id,
+    on_behalf_of_person_id,
+    is_on_behalf,
+    business_id,
+    purpose_notes,
+    request_status_id
   )
-  VALUES (p_requested_by, p_on_behalf_of, p_is_on_behalf,
-          p_business_id, p_purpose_notes, v_status_id)
+  VALUES (
+    p_requested_by,
+    CASE WHEN v_is_on_behalf THEN v_subject_id ELSE NULL END,
+    v_is_on_behalf,
+    p_business_id,
+    p_purpose_notes,
+    v_status_id
+  )
   RETURNING doc_request_id INTO v_hdr_id;
 
   PERFORM doc_log_event(
     'REQUEST_CREATED','doc_request_hdr',v_hdr_id,
     jsonb_build_object(
       'requested_by',  p_requested_by,
-      'on_behalf_of',  p_on_behalf_of,
+      'subject_id',    v_subject_id,
+      'on_behalf',     v_is_on_behalf,
       'business_id',   p_business_id,
       'purpose_notes', p_purpose_notes
     ),
     NULL, p_requested_by
   );
 
-  -- Lines
-  FOR v_row IN SELECT * FROM jsonb_array_elements(p_lines)
+  -- ------------------ Lines ------------------
+  FOR v_row IN
+    SELECT * FROM jsonb_array_elements(p_lines)
   LOOP
     v_fee_id      := NULL;
     v_def_details := NULL;
     v_def_offense := NULL;
 
-    -- Prefer: resolve by document_purpose_id
+    -- Resolve fee item
     IF (v_row ? 'document_purpose_id') THEN
       SELECT dp.fee_item_id, dp.default_details, dp.default_offense_no
-      INTO   v_fee_id,    v_def_details,  v_def_offense
+      INTO   v_fee_id,      v_def_details,     v_def_offense
       FROM document_purpose dp
       WHERE dp.document_purpose_id = (v_row->>'document_purpose_id')::INT;
 
@@ -650,7 +720,6 @@ BEGIN
         RAISE EXCEPTION 'Unknown document_purpose_id: %', (v_row->>'document_purpose_id');
       END IF;
 
-    -- Fallback: resolve by fee_code (back-compat)
     ELSIF (v_row ? 'fee_code') THEN
       SELECT fi.fee_item_id
       INTO   v_fee_id
@@ -664,44 +733,44 @@ BEGIN
       RAISE EXCEPTION 'Line must include document_purpose_id or fee_code';
     END IF;
 
-    -- Ensure fee item is active
-    IF NOT EXISTS (SELECT 1 FROM fee_item WHERE fee_item_id=v_fee_id AND is_active) THEN
-      RAISE EXCEPTION 'Fee item is not active.';
+    -- Fee must be active
+    IF NOT EXISTS (SELECT 1 FROM fee_item WHERE fee_item_id = v_fee_id AND is_active) THEN
+      RAISE EXCEPTION 'Fee item is not active (fee_item_id=%).', v_fee_id;
     END IF;
 
-    v_qty := COALESCE( (v_row->>'quantity')::INT, 1 );
+    -- Quantity
+    v_qty := COALESCE(NULLIF(v_row->>'quantity','')::INT, 1);
     IF v_qty <= 0 THEN
       RAISE EXCEPTION 'Quantity must be > 0';
     END IF;
 
-    -- Merge details: default_details (from purpose) < overridden details (from UI)
+    -- Details merge: defaults < UI overrides
     v_details := COALESCE(v_def_details, '{}'::jsonb) || COALESCE(v_row->'details','{}'::jsonb);
 
-    -- Offense: explicit from UI or default from purpose
+    -- Offense: explicit or default
     v_offense := COALESCE(NULLIF(v_row->>'offense_no','')::INT, v_def_offense);
 
-    -- Base calc for the entire line (quantity copies)
-    v_base  := (SELECT current_amount FROM fee_item WHERE fee_item_id=v_fee_id) * v_qty;
+    -- Base for entire line
+    v_base  := (SELECT current_amount FROM fee_item WHERE fee_item_id = v_fee_id) * v_qty;
 
-    -- Waiver for the person (one copy) * quantity
-    v_waive := compute_exemption_amount(COALESCE(p_on_behalf_of, p_requested_by),
-                                        v_fee_id,
-                                        v_details) * v_qty;
+    -- Waiver for SUBJECT * quantity
+    v_waive := COALESCE(compute_exemption_amount(v_subject_id, v_fee_id, v_details), 0) * v_qty;
 
-    -- Surcharge on net base (after waiver), if any offense
+    -- Surcharge on (base - waive)
     v_surch := CASE WHEN v_offense IS NOT NULL THEN
-                (v_base - v_waive) * (get_surcharge_percent(v_fee_id, v_offense) / 100.0)
+                (v_base - v_waive) * (COALESCE(get_surcharge_percent(v_fee_id, v_offense),0) / 100.0)
               ELSE 0 END;
 
-    v_total := GREATEST(v_base - v_waive + v_surch, 0);
+    v_total := GREATEST(v_base - v_waive + v_surch, 0); 
 
     INSERT INTO doc_request_line(
       doc_request_id, fee_item_id, quantity,
       base_amount, waived_amount, surcharge_amount, line_total, details
+      -- add offense_no column here if your schema has it
     )
     VALUES (
       v_hdr_id, v_fee_id, v_qty,
-      v_base,   v_waive,  v_surch,          v_total,   v_details
+      v_base,   v_waive,  v_surch, v_total, v_details
     )
     RETURNING doc_request_line_id INTO v_line_id;
 
@@ -721,120 +790,6 @@ BEGIN
   RETURN v_hdr_id;
 END
 $$;
-
-
--- Amount due (unchanged)
-CREATE OR REPLACE FUNCTION get_request_amount_due(p_doc_request_id INT)
-RETURNS NUMERIC
-LANGUAGE sql AS $$
-  SELECT COALESCE(SUM(line_total),0) FROM doc_request_line WHERE doc_request_id=p_doc_request_id;
-$$;
-
--- Accept payment (unchanged)
-CREATE OR REPLACE FUNCTION treasurer_accept_payment(
-  p_doc_request_id INT,
-  p_payment_method_id INT,
-  p_received_by_staff_id INT,
-  p_amount_paid NUMERIC,
-  p_or_number TEXT DEFAULT NULL
-) RETURNS INT
-LANGUAGE plpgsql AS $$
-DECLARE
-  v_due NUMERIC;
-  v_change NUMERIC;
-  v_or_id INT;
-  v_or_num TEXT;
-  v_paid_status INT := (SELECT request_status_id FROM request_status WHERE request_status_name='PAID' LIMIT 1);
-BEGIN
-  v_due := get_request_amount_due(p_doc_request_id);
-  IF p_amount_paid < v_due THEN
-    RAISE EXCEPTION 'Amount paid (%.2f) is less than amount due (%.2f)', p_amount_paid, v_due;
-  END IF;
-  v_change := p_amount_paid - v_due;
-  v_or_num := COALESCE(p_or_number, make_or_number());
-
-  INSERT INTO official_receipt(or_number,issued_by_staff_id,doc_request_id,payment_method_id,amount_due,amount_paid,change_due)
-  VALUES (v_or_num, p_received_by_staff_id, p_doc_request_id, p_payment_method_id, v_due, p_amount_paid, v_change)
-  RETURNING or_id INTO v_or_id;
-
-  PERFORM doc_log_event(
-    'PAYMENT_ACCEPTED','official_receipt',v_or_id,
-    jsonb_build_object('doc_request_id',p_doc_request_id,'or_number',v_or_num,'payment_method_id',p_payment_method_id,'amount_due',v_due,'amount_paid',p_amount_paid,'change_due',v_change),
-    p_received_by_staff_id, NULL
-  );
-
-  UPDATE doc_request_hdr
-     SET request_status_id=v_paid_status, current_status_set_at=now()
-   WHERE doc_request_id=p_doc_request_id;
-
-  PERFORM doc_log_event(
-    'STATUS_CHANGED','doc_request_hdr',p_doc_request_id,
-    jsonb_build_object('to_status','PAID'),
-    p_received_by_staff_id, NULL
-  );
-
-  RETURN v_or_id;
-END $$;
-
--- Forward to printing (unchanged)
-CREATE OR REPLACE FUNCTION forward_to_clerk_for_printing(p_doc_request_id INT)
-RETURNS VOID
-LANGUAGE plpgsql AS $$
-DECLARE v_stat INT := (SELECT request_status_id FROM request_status WHERE request_status_name='FOR_PRINTING' LIMIT 1);
-BEGIN
-  UPDATE doc_request_hdr SET request_status_id=v_stat, current_status_set_at=now()
-  WHERE doc_request_id=p_doc_request_id;
-
-  PERFORM doc_log_event(
-    'STATUS_CHANGED','doc_request_hdr',p_doc_request_id,
-    jsonb_build_object('to_status','FOR_PRINTING')
-  );
-END $$;
-
--- Release (unchanged)
-CREATE OR REPLACE FUNCTION mark_request_released(p_doc_request_id INT)
-RETURNS VOID
-LANGUAGE plpgsql AS $$
-DECLARE v_stat INT := (SELECT request_status_id FROM request_status WHERE request_status_name='RELEASED' LIMIT 1);
-BEGIN
-  UPDATE doc_request_hdr SET request_status_id=v_stat, current_status_set_at=now()
-  WHERE doc_request_id=p_doc_request_id;
-
-  PERFORM doc_log_event(
-    'STATUS_CHANGED','doc_request_hdr',p_doc_request_id,
-    jsonb_build_object('to_status','RELEASED')
-  );
-END $$;
-
--- Update fee (unchanged)
-CREATE OR REPLACE FUNCTION treasurer_update_fee_amount(
-  p_fee_code TEXT,
-  p_new_amount NUMERIC,
-  p_changed_by_staff_id INT,
-  p_reason TEXT DEFAULT NULL
-) RETURNS VOID
-LANGUAGE plpgsql AS $$
-DECLARE
-  v_item fee_item%ROWTYPE;
-BEGIN
-  SELECT * INTO v_item FROM fee_item WHERE fee_code=p_fee_code FOR UPDATE;
-  IF NOT FOUND THEN RAISE EXCEPTION 'Unknown fee_code: %', p_fee_code; END IF;
-  IF v_item.max_amount IS NOT NULL AND p_new_amount > v_item.max_amount THEN
-    RAISE EXCEPTION 'New amount (%.2f) exceeds ceiling (%.2f)', p_new_amount, v_item.max_amount;
-  END IF;
-
-  INSERT INTO fee_change_log(fee_item_id, old_amount, new_amount, changed_by_staff_id, reason)
-  VALUES (v_item.fee_item_id, v_item.current_amount, p_new_amount, p_changed_by_staff_id, p_reason);
-
-  UPDATE fee_item SET current_amount=p_new_amount WHERE fee_item_id=v_item.fee_item_id;
-
-  PERFORM doc_log_event(
-    'FEE_UPDATED','fee_item',v_item.fee_item_id,
-    jsonb_build_object('fee_code',v_item.fee_code,'old_amount',v_item.current_amount,'new_amount',p_new_amount,'reason',p_reason),
-    p_changed_by_staff_id, NULL,
-    'current_amount', v_item.current_amount::text, p_new_amount::text
-  );
-END $$;
 
 -- ================================================= H =======================================
 -- List with doc types, purposes, copies, and payment summary
