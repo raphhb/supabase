@@ -791,6 +791,120 @@ BEGIN
 END
 $$;
 
+
+-- Amount due (unchanged)
+CREATE OR REPLACE FUNCTION get_request_amount_due(p_doc_request_id INT)
+RETURNS NUMERIC
+LANGUAGE sql AS $$
+  SELECT COALESCE(SUM(line_total),0) FROM doc_request_line WHERE doc_request_id=p_doc_request_id;
+$$;
+
+-- Accept payment (unchanged)
+CREATE OR REPLACE FUNCTION treasurer_accept_payment(
+  p_doc_request_id INT,
+  p_payment_method_id INT,
+  p_received_by_staff_id INT,
+  p_amount_paid NUMERIC,
+  p_or_number TEXT DEFAULT NULL
+) RETURNS INT
+LANGUAGE plpgsql AS $$
+DECLARE
+  v_due NUMERIC;
+  v_change NUMERIC;
+  v_or_id INT;
+  v_or_num TEXT;
+  v_paid_status INT := (SELECT request_status_id FROM request_status WHERE request_status_name='PAID' LIMIT 1);
+BEGIN
+  v_due := get_request_amount_due(p_doc_request_id);
+  IF p_amount_paid < v_due THEN
+    RAISE EXCEPTION 'Amount paid (%.2f) is less than amount due (%.2f)', p_amount_paid, v_due;
+  END IF;
+  v_change := p_amount_paid - v_due;
+  v_or_num := COALESCE(p_or_number, make_or_number());
+
+  INSERT INTO official_receipt(or_number,issued_by_staff_id,doc_request_id,payment_method_id,amount_due,amount_paid,change_due)
+  VALUES (v_or_num, p_received_by_staff_id, p_doc_request_id, p_payment_method_id, v_due, p_amount_paid, v_change)
+  RETURNING or_id INTO v_or_id;
+
+  PERFORM doc_log_event(
+    'PAYMENT_ACCEPTED','official_receipt',v_or_id,
+    jsonb_build_object('doc_request_id',p_doc_request_id,'or_number',v_or_num,'payment_method_id',p_payment_method_id,'amount_due',v_due,'amount_paid',p_amount_paid,'change_due',v_change),
+    p_received_by_staff_id, NULL
+  );
+
+  UPDATE doc_request_hdr
+     SET request_status_id=v_paid_status, current_status_set_at=now()
+   WHERE doc_request_id=p_doc_request_id;
+
+  PERFORM doc_log_event(
+    'STATUS_CHANGED','doc_request_hdr',p_doc_request_id,
+    jsonb_build_object('to_status','PAID'),
+    p_received_by_staff_id, NULL
+  );
+
+  RETURN v_or_id;
+END $$;
+
+-- Forward to printing (unchanged)
+CREATE OR REPLACE FUNCTION forward_to_clerk_for_printing(p_doc_request_id INT)
+RETURNS VOID
+LANGUAGE plpgsql AS $$
+DECLARE v_stat INT := (SELECT request_status_id FROM request_status WHERE request_status_name='FOR_PRINTING' LIMIT 1);
+BEGIN
+  UPDATE doc_request_hdr SET request_status_id=v_stat, current_status_set_at=now()
+  WHERE doc_request_id=p_doc_request_id;
+
+  PERFORM doc_log_event(
+    'STATUS_CHANGED','doc_request_hdr',p_doc_request_id,
+    jsonb_build_object('to_status','FOR_PRINTING')
+  );
+END $$;
+
+-- Release (unchanged)
+CREATE OR REPLACE FUNCTION mark_request_released(p_doc_request_id INT)
+RETURNS VOID
+LANGUAGE plpgsql AS $$
+DECLARE v_stat INT := (SELECT request_status_id FROM request_status WHERE request_status_name='RELEASED' LIMIT 1);
+BEGIN
+  UPDATE doc_request_hdr SET request_status_id=v_stat, current_status_set_at=now()
+  WHERE doc_request_id=p_doc_request_id;
+
+  PERFORM doc_log_event(
+    'STATUS_CHANGED','doc_request_hdr',p_doc_request_id,
+    jsonb_build_object('to_status','RELEASED')
+  );
+END $$;
+
+-- Update fee (unchanged)
+CREATE OR REPLACE FUNCTION treasurer_update_fee_amount(
+  p_fee_code TEXT,
+  p_new_amount NUMERIC,
+  p_changed_by_staff_id INT,
+  p_reason TEXT DEFAULT NULL
+) RETURNS VOID
+LANGUAGE plpgsql AS $$
+DECLARE
+  v_item fee_item%ROWTYPE;
+BEGIN
+  SELECT * INTO v_item FROM fee_item WHERE fee_code=p_fee_code FOR UPDATE;
+  IF NOT FOUND THEN RAISE EXCEPTION 'Unknown fee_code: %', p_fee_code; END IF;
+  IF v_item.max_amount IS NOT NULL AND p_new_amount > v_item.max_amount THEN
+    RAISE EXCEPTION 'New amount (%.2f) exceeds ceiling (%.2f)', p_new_amount, v_item.max_amount;
+  END IF;
+
+  INSERT INTO fee_change_log(fee_item_id, old_amount, new_amount, changed_by_staff_id, reason)
+  VALUES (v_item.fee_item_id, v_item.current_amount, p_new_amount, p_changed_by_staff_id, p_reason);
+
+  UPDATE fee_item SET current_amount=p_new_amount WHERE fee_item_id=v_item.fee_item_id;
+
+  PERFORM doc_log_event(
+    'FEE_UPDATED','fee_item',v_item.fee_item_id,
+    jsonb_build_object('fee_code',v_item.fee_code,'old_amount',v_item.current_amount,'new_amount',p_new_amount,'reason',p_reason),
+    p_changed_by_staff_id, NULL,
+    'current_amount', v_item.current_amount::text, p_new_amount::text
+  );
+END $$;
+
 -- ================================================= H =======================================
 -- List with doc types, purposes, copies, and payment summary
 CREATE OR REPLACE VIEW v_doc_request_list_ex AS
