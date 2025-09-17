@@ -299,32 +299,41 @@ LANGUAGE sql AS $$
 $$;
 
 -- 5) Resident profile flags (unchanged)
+-- update get_resident_profile_flags, 11:15 PM, September 17, 2025
 CREATE OR REPLACE FUNCTION get_resident_profile_flags(p_person_id INT)
 RETURNS TABLE(
-  person_id INT, first_name TEXT, last_name TEXT,
-  is_student BOOLEAN, is_senior BOOLEAN, is_pwd BOOLEAN, is_indigent BOOLEAN, is_ftj BOOLEAN
+  person_id INT,
+  first_name TEXT,
+  last_name TEXT,
+  is_student BOOLEAN,
+  is_senior  BOOLEAN,
+  is_pwd     BOOLEAN,
+  is_indigent BOOLEAN,
+  is_ftj     BOOLEAN
 )
-LANGUAGE sql AS $$
-  SELECT p.person_id, p.first_name, p.last_name,
-         (EXISTS (SELECT 1 FROM employment_status es
-                  WHERE es.employment_status_id = p.employment_status_id
-                    AND upper(es.employment_status_name) LIKE '%STUDENT%'))
-         OR (EXISTS (SELECT 1 FROM educational_attainment ea
-                     WHERE ea.education_id = p.education_id
-                       AND upper(ea.educ_level) LIKE '%STUDENT%')) AS is_student,
-         (age(current_date, p.birthdate) >= interval '60 years') AS is_senior,
-         (EXISTS (SELECT 1 FROM government_membership_prog g
-                  WHERE g.gov_mem_prog_id = p.gov_mem_prog_id
-                    AND upper(g.gov_mem_prog_name) = 'PWD')) AS is_pwd,
-         (EXISTS (SELECT 1 FROM government_membership_prog g
-                  WHERE g.gov_mem_prog_id = p.gov_mem_prog_id
-                    AND upper(g.gov_mem_prog_name) = 'INDIGENT')) AS is_indigent,
-         (EXISTS (SELECT 1 FROM government_membership_prog g
-                  WHERE g.gov_mem_prog_id = p.gov_mem_prog_id
-                    AND upper(g.gov_mem_prog_name) = 'FIRST_TIME_JOBSEEKER')) AS is_ftj
+LANGUAGE sql
+AS $$
+  WITH prog AS (
+    SELECT g.gov_mem_prog_name
+    FROM person_gov_program pgp
+    JOIN government_membership_prog g
+      ON g.gov_mem_prog_id = pgp.gov_mem_prog_id
+    WHERE pgp.person_id = p_person_id
+      AND pgp.is_active
+  )
+  SELECT
+    p.person_id,
+    p.first_name,
+    p.last_name,
+    COALESCE(p.is_student, FALSE) AS is_student,
+    (age(current_date, p.birthdate) >= interval '60 years') AS is_senior,
+    EXISTS (SELECT 1 FROM prog WHERE UPPER(gov_mem_prog_name) = 'PWD')                      AS is_pwd,
+    EXISTS (SELECT 1 FROM prog WHERE UPPER(gov_mem_prog_name) = 'INDIGENT')                 AS is_indigent,
+    EXISTS (SELECT 1 FROM prog WHERE UPPER(gov_mem_prog_name) = 'FIRST TIME JOBSEEKER')     AS is_ftj
   FROM person p
   WHERE p.person_id = p_person_id;
 $$;
+
 
 -- 6) Businesses owned by a person (unchanged)
 CREATE OR REPLACE FUNCTION get_businesses_owned_by_person(p_person_id INT)
@@ -402,42 +411,52 @@ $$;
 
 -- Returns the amount to waive for ONE copy of a fee item for a person.
 -- Caller multiplies by quantity (as you already do).
+-- Updated 11:17 PM, SEPTEMBER 17, 2025
 CREATE OR REPLACE FUNCTION compute_exemption_amount(
   p_person_id   INT,
   p_fee_item_id INT,
   p_details     JSONB DEFAULT '{}'::jsonb
 ) RETURNS NUMERIC
-LANGUAGE plpgsql AS $$
+LANGUAGE plpgsql
+AS $$
 DECLARE
   v_fee       fee_item%ROWTYPE;
-  v_prog      TEXT;
   v_is_senior BOOLEAN := FALSE;
+  v_has_ftj   BOOLEAN := FALSE;
+  v_has_pwd   BOOLEAN := FALSE;
+  v_has_ind   BOOLEAN := FALSE;
   v_ex        NUMERIC := 0;
 BEGIN
+  -- load fee row
   SELECT * INTO v_fee FROM fee_item WHERE fee_item_id = p_fee_item_id;
   IF NOT FOUND THEN
     RETURN 0;
   END IF;
 
-  -- Resident program (PWD / INDIGENT / FIRST_TIME_JOBSEEKER, etc.)
-  SELECT upper(g.gov_mem_prog_name) INTO v_prog
-  FROM person p
-  LEFT JOIN government_membership_prog g ON g.gov_mem_prog_id = p.gov_mem_prog_id
-  WHERE p.person_id = p_person_id;
-
-  -- Senior flag by age
+  -- senior by age
   SELECT age(current_date, p.birthdate) >= interval '60 years'
   INTO v_is_senior
   FROM person p
   WHERE p.person_id = p_person_id;
 
-  -- Apply full waivers based on fee flags
-  IF v_fee.exempt_ftj      AND v_prog = 'FIRST_TIME_JOBSEEKER' THEN v_ex := v_fee.current_amount; END IF;
-  IF v_fee.exempt_pwd      AND v_prog = 'PWD'                   THEN v_ex := v_fee.current_amount; END IF;
-  IF v_fee.exempt_indigent AND v_prog = 'INDIGENT'              THEN v_ex := v_fee.current_amount; END IF;
-  IF v_fee.exempt_senior   AND v_is_senior                      THEN v_ex := v_fee.current_amount; END IF;
+  -- program flags from person_gov_program (active only)
+  SELECT
+    BOOL_OR(UPPER(g.gov_mem_prog_name) = 'FIRST TIME JOBSEEKER'),
+    BOOL_OR(UPPER(g.gov_mem_prog_name) = 'PWD'),
+    BOOL_OR(UPPER(g.gov_mem_prog_name) = 'INDIGENT')
+  INTO v_has_ftj, v_has_pwd, v_has_ind
+  FROM person_gov_program pgp
+  JOIN government_membership_prog g
+    ON g.gov_mem_prog_id = pgp.gov_mem_prog_id
+  WHERE pgp.person_id = p_person_id
+    AND pgp.is_active;
 
-  -- Never exceed the fee itself
+  -- apply full waivers based on fee flags
+  IF v_fee.exempt_ftj      AND v_has_ftj  THEN v_ex := v_fee.current_amount; END IF;
+  IF v_fee.exempt_pwd      AND v_has_pwd  THEN v_ex := v_fee.current_amount; END IF;
+  IF v_fee.exempt_indigent AND v_has_ind  THEN v_ex := v_fee.current_amount; END IF;
+  IF v_fee.exempt_senior   AND v_is_senior THEN v_ex := v_fee.current_amount; END IF;
+
   IF v_ex > v_fee.current_amount THEN
     v_ex := v_fee.current_amount;
   END IF;
@@ -445,6 +464,24 @@ BEGIN
   RETURN COALESCE(v_ex, 0);
 END
 $$;
+
+
+-- tiny helper that checks gov program
+CREATE OR REPLACE FUNCTION has_program(p_person_id INT, p_prog TEXT)
+RETURNS BOOLEAN
+LANGUAGE sql
+AS $$
+  SELECT EXISTS (
+    SELECT 1
+    FROM person_gov_program pgp
+    JOIN government_membership_prog g
+      ON g.gov_mem_prog_id = pgp.gov_mem_prog_id
+    WHERE pgp.person_id = p_person_id
+      AND pgp.is_active
+      AND UPPER(g.gov_mem_prog_name) = UPPER(p_prog)
+  );
+$$;
+
 
 -- Offense % helper (unchanged)
 CREATE OR REPLACE FUNCTION get_surcharge_percent(
@@ -570,6 +607,18 @@ $$;
 --   • direct edge: requester → subject ∈ allowed_on_behalf_relationship
 --   • inverse edge: subject   → requester ∈ v_inverse_ok_ids (e.g., CHILD/SON/DAUGHTER)
 -- =====================================================================
+
+-- ADDED: 11:13 PM, SEPTEMBER 17, 2025
+CREATE INDEX IF NOT EXISTS ix_person_gov_program_person_prog
+  ON person_gov_program(person_id, gov_mem_prog_id)
+  WHERE is_active;
+
+-- ADDED: 11:13 PM, SEPTEMBER 17, 2025
+-- (optional) prevent duplicate active memberships of the same kind
+CREATE UNIQUE INDEX IF NOT EXISTS uq_person_gov_program_active
+  ON person_gov_program(person_id, gov_mem_prog_id)
+  WHERE is_active;
+
 CREATE OR REPLACE FUNCTION public.create_document_request(
   p_requested_by    INT,
   p_on_behalf_of    INT,
