@@ -799,7 +799,7 @@ LANGUAGE sql AS $$
   SELECT COALESCE(SUM(line_total),0) FROM doc_request_line WHERE doc_request_id=p_doc_request_id;
 $$;
 
--- Accept payment (unchanged)
+-- Accept payment (unchanged) Updated: September 17, 2025, 11:08 PM
 CREATE OR REPLACE FUNCTION treasurer_accept_payment(
   p_doc_request_id INT,
   p_payment_method_id INT,
@@ -845,35 +845,111 @@ BEGIN
   RETURN v_or_id;
 END $$;
 
--- Forward to printing (unchanged)
-CREATE OR REPLACE FUNCTION forward_to_clerk_for_printing(p_doc_request_id INT)
-RETURNS VOID
+-- Optional: tiny audit table (safe/idempotent)
+create table if not exists doc_request_status_audit (
+  id                  serial primary key,
+  doc_request_id      int not null references doc_request_hdr(doc_request_id) on delete cascade,
+  from_status_id      int references request_status(request_status_id),
+  to_status_id        int not null references request_status(request_status_id),
+  changed_at          timestamptz not null default now(),
+  changed_by_staff_id int references staff(staff_id),
+  reason              text
+);
+
+-- DROP FUNCTION forward_to_clerk_for_printing(integer,integer,text)
+-- FOR PRINTING QUERY UPDATED: 11:09 PM, SEPTEMBER 17, 2025
+CREATE OR REPLACE FUNCTION forward_to_clerk_for_printing(
+  p_doc_request_id INT,
+  p_staff_id       INT,          -- NEW
+  p_reason         TEXT DEFAULT NULL
+) RETURNS VOID
 LANGUAGE plpgsql AS $$
-DECLARE v_stat INT := (SELECT request_status_id FROM request_status WHERE request_status_name='FOR_PRINTING' LIMIT 1);
+DECLARE
+  v_stat  INT := (SELECT request_status_id FROM request_status
+                  WHERE request_status_name='FOR_PRINTING' LIMIT 1);
+  v_from  INT;
 BEGIN
-  UPDATE doc_request_hdr SET request_status_id=v_stat, current_status_set_at=now()
-  WHERE doc_request_id=p_doc_request_id;
+  SELECT request_status_id INTO v_from
+  FROM doc_request_hdr WHERE doc_request_id = p_doc_request_id;
+
+  UPDATE doc_request_hdr
+     SET request_status_id = v_stat,
+         current_status_set_at = now()
+   WHERE doc_request_id = p_doc_request_id;
 
   PERFORM doc_log_event(
-    'STATUS_CHANGED','doc_request_hdr',p_doc_request_id,
-    jsonb_build_object('to_status','FOR_PRINTING')
+    'STATUS_CHANGED','doc_request_hdr', p_doc_request_id,
+    jsonb_build_object('from_status_id', v_from, 'to_status','FOR_PRINTING','reason', p_reason),
+    p_performer_staff_id := p_staff_id       -- 👈 attribute to staff
   );
 END $$;
 
--- Release (unchanged)
-CREATE OR REPLACE FUNCTION mark_request_released(p_doc_request_id INT)
-RETURNS VOID
-LANGUAGE plpgsql AS $$
-DECLARE v_stat INT := (SELECT request_status_id FROM request_status WHERE request_status_name='RELEASED' LIMIT 1);
-BEGIN
-  UPDATE doc_request_hdr SET request_status_id=v_stat, current_status_set_at=now()
-  WHERE doc_request_id=p_doc_request_id;
+GRANT EXECUTE ON FUNCTION forward_to_clerk_for_printing(INT,INT,TEXT)
+TO anon, authenticated, service_role;
 
-  PERFORM doc_log_event(
-    'STATUS_CHANGED','doc_request_hdr',p_doc_request_id,
-    jsonb_build_object('to_status','RELEASED')
+
+-- FOR RELEASED UPDATED: 11:09 PM, SEPTEMBER 17, 2025
+-- Mark as released WITH staff attribution + optional guard + reason
+CREATE OR REPLACE FUNCTION mark_request_released(
+  p_doc_request_id INT,
+  p_staff_id       INT,
+  p_reason         TEXT DEFAULT NULL
+) RETURNS VOID
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_from_id INT;
+  v_to_id   INT := (
+    SELECT request_status_id
+    FROM request_status
+    WHERE request_status_name = 'RELEASED'
+    LIMIT 1
   );
-END $$;
+BEGIN
+  -- Lock row and read current status
+  SELECT request_status_id
+    INTO v_from_id
+    FROM doc_request_hdr
+   WHERE doc_request_id = p_doc_request_id
+   FOR UPDATE;
+
+  IF v_from_id IS NULL THEN
+    RAISE EXCEPTION 'Unknown doc_request_id: %', p_doc_request_id;
+  END IF;
+
+  -- Optional: only allow from PAID or FOR_PRINTING
+  IF v_from_id NOT IN (
+    SELECT request_status_id
+      FROM request_status
+     WHERE request_status_name IN ('PAID','FOR_PRINTING')
+  ) THEN
+    RAISE EXCEPTION 'Cannot mark released from current status (id=%).', v_from_id;
+  END IF;
+
+  -- Update status
+  UPDATE doc_request_hdr
+     SET request_status_id    = v_to_id,
+         current_status_set_at = now()
+   WHERE doc_request_id       = p_doc_request_id;
+
+  -- Timeline entry (will show staff attribution)
+  PERFORM doc_log_event(
+    'STATUS_CHANGED',                 -- action
+    'doc_request_hdr',                -- table
+    p_doc_request_id,                 -- record
+    jsonb_build_object(
+      'from_status_id', v_from_id,
+      'to_status',      'RELEASED',
+      'reason',         p_reason
+    ),
+    p_performer_staff_id := p_staff_id
+  );
+END
+$$;
+
+-- (optional) grant execute to your app roles
+-- GRANT EXECUTE ON FUNCTION mark_request_released(INT,INT,TEXT) TO authenticated, anon, service_role;
+
 
 -- Update fee (unchanged)
 CREATE OR REPLACE FUNCTION treasurer_update_fee_amount(
