@@ -1276,3 +1276,198 @@ LEFT JOIN public.staff s      ON (ut.user_type_name='STAFF'    AND s.staff_id = 
 LEFT JOIN public.person ps    ON ps.person_id = s.person_id
 LEFT JOIN public.person pr    ON (ut.user_type_name='RESIDENT' AND pr.person_id = cl.performer_id)
 ORDER BY cl.date_time DESC, cl.common_log_id DESC;
+
+-- ADDED SEPTEMBER 18:
+
+-- 3:55, USED 4:50 AM
+-- ******************* USED *******************
+-- ============================================================
+-- PERSON SNAPSHOT (matches YOUR schema)
+-- ============================================================
+create or replace function get_person_for_docs(p_person_id int)
+returns table (
+  person_id    int,
+  first_name   text,
+  last_name    text,
+  full_name    text,
+  birthdate    date,
+  age          int,
+  civil_status text,
+  nationality  text,
+  street       text,
+  barangay     text,
+  city         text,
+  province     text,
+  address      text
+)
+language sql
+as $$
+  select
+    p.person_id,
+    coalesce(p.first_name,'')  as first_name,
+    coalesce(p.last_name,'')   as last_name,
+    trim(concat_ws(' ', p.first_name, p.middle_name, p.last_name, p.suffix)) as full_name,
+    p.birthdate,
+    extract(year from age(current_date, p.birthdate))::int as age,
+
+    coalesce(cs.civil_status_name, '')          as civil_status,
+    coalesce(nat.nationality_name, 'Filipino')  as nationality,
+
+    coalesce(a.street,'')                       as street,
+    coalesce(a.barangay,'Sto. Niño')            as barangay,
+    coalesce(a.city,'Cebu City')                as city,
+    -- addresss has no province column; use a sane default unless you add one
+    'Cebu'::text                                as province,
+
+    trim(concat_ws(', ',
+      nullif(a.street,''),
+      case when coalesce(a.barangay,'')='' then null else 'Brgy. '||a.barangay end,
+      coalesce(a.city,'Cebu City'),
+      'Cebu'
+    )) as address
+  from person p
+  left join civil_status cs on cs.civil_status_id = p.civil_status_id
+  left join nationality nat on nat.nationality_id = p.nationality_id
+  left join addresss a      on a.address_id       = p.address_id
+  where p.person_id = p_person_id;
+$$;
+
+
+-- ******************* USED *******************
+-- ============================================================
+-- LATEST OFFICIAL RECEIPT FOR A REQUEST
+-- ============================================================
+create or replace function get_latest_or_for_request(p_doc_request_id int)
+returns table (or_number text, issued_at timestamptz)
+language sql
+as $$
+  select
+    (array_agg(o.or_number order by o.issued_at desc))[1],
+    max(o.issued_at)
+  from official_receipt o
+  where o.doc_request_id = p_doc_request_id;
+$$;
+
+
+-- ******************* USED *******************
+-- ============================================================
+-- BARANGAY CAPTAIN NAME (replace with your own source if you have one)
+-- ============================================================
+create or replace function get_current_brgy_captain()
+returns text
+language sql immutable
+as $$ select 'Lourdes R. Ramirez'::text; $$;
+
+
+-- ******************* USED *******************
+-- ============================================================
+-- DETAIL LINES (normalized, with purpose label & doc type name)
+-- ============================================================
+create or replace view v_doc_request_detail_lines_ex as
+select
+  l.doc_request_line_id                            as doc_request_line_id,
+  l.doc_request_id,
+  fi.name                                          as fee_name,
+  rdt.request_document_type_name                   as document_type_name,
+  (l.details->>'purpose_code')                     as purpose_code,
+  dp.purpose_label                                 as purpose_label,
+  l.quantity,
+  l.base_amount,
+  l.waived_amount,
+  l.surcharge_amount,
+  l.line_total,
+  l.details
+from doc_request_line l
+join fee_item fi on fi.fee_item_id = l.fee_item_id
+left join request_document_type rdt
+  on rdt.request_document_type_id = fi.request_document_type_id
+left join document_purpose dp
+  on dp.request_document_type_id = rdt.request_document_type_id
+ and dp.purpose_code            = (l.details->>'purpose_code')
+order by l.doc_request_line_id;
+
+
+
+-- ******************* USED *******************
+-- ============================================================
+-- ONE-SHOT BUNDLE FOR CLERK DETAIL PAGE & PDF FILL
+-- ============================================================
+select * from fetch_doc_request_detail_bundle(24)
+
+create or replace function fetch_doc_request_detail_bundle(p_doc_request_id int)
+returns jsonb
+language sql
+as $$
+  with
+  hdr as (
+    select
+      h.doc_request_id,
+      h.request_code,
+      h.created_at,
+      rs.request_status_name as status,
+      h.requested_by_person_id,
+
+      -- From person helper
+      (select full_name    from get_person_for_docs(h.requested_by_person_id)) as requester_full_name,
+      (select age          from get_person_for_docs(h.requested_by_person_id)) as requester_age,
+      (select civil_status from get_person_for_docs(h.requested_by_person_id)) as civil_status,
+      (select nationality  from get_person_for_docs(h.requested_by_person_id)) as nationality,
+      (select address      from get_person_for_docs(h.requested_by_person_id)) as address,
+      (select barangay     from get_person_for_docs(h.requested_by_person_id)) as barangay,
+      (select city         from get_person_for_docs(h.requested_by_person_id)) as city,
+      (select province     from get_person_for_docs(h.requested_by_person_id)) as province,
+
+      (select get_current_brgy_captain()) as captain_name,
+      coalesce(sum(l.line_total),0) as amount_due
+    from doc_request_hdr h
+    join request_status rs on rs.request_status_id = h.request_status_id
+    left join doc_request_line l on l.doc_request_id = h.doc_request_id
+    where h.doc_request_id = p_doc_request_id
+    group by h.doc_request_id, h.request_code, h.created_at, rs.request_status_name, h.requested_by_person_id
+  ),
+  lines as (
+    select jsonb_agg(to_jsonb(x)) as js
+    from (
+      select
+        doc_request_line_id,
+        doc_request_id,
+        document_type_name,
+        purpose_code,
+        purpose_label,
+        quantity,
+        line_total,
+        details
+      from v_doc_request_detail_lines_ex
+      where doc_request_id = p_doc_request_id
+      order by line_total desc, doc_request_line_id
+    ) x
+  ),
+  pay as (
+    select to_jsonb(p) as js
+    from (
+      select
+        (select or_number from get_latest_or_for_request(p_doc_request_id)) as latest_or_number,
+        (select issued_at from get_latest_or_for_request(p_doc_request_id)) as latest_or_time
+    ) p
+  ),
+  tl as (
+    select jsonb_agg(to_jsonb(t)) as js
+    from (
+      select
+        vt.occurred_at,
+        vt.action,
+        coalesce(vt.staff_name, vt.resident_name) as actor
+      from v_document_timeline vt
+      where vt.table_affected in ('doc_request_hdr','doc_request_line','official_receipt')
+        and vt.record_affected_id = p_doc_request_id
+      order by vt.occurred_at
+    ) t
+  )
+  select jsonb_build_object(
+    'header',   (select to_jsonb(h) from hdr h),
+    'lines',    coalesce((select lines.js from lines), '[]'::jsonb),
+    'payments', (select pay.js from pay),
+    'timeline', coalesce((select tl.js from tl), '[]'::jsonb)
+  );
+$$;
+
